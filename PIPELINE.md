@@ -11,7 +11,7 @@
 | 2 | Requirements  | pending                                   | — |
 | 3 | UX mock       | pending                                   | — |
 | 4 | Architecture  | pending                                   | — |
-| 5 | Build         | pending                                   | — |
+| 5 | Build         | IN PROGRESS — real DevNet data wired, PR open (see below) | branch `feat/real-network-sources` |
 | 6 | Code review   | pending — audit + fix                     | — |
 | 7 | Browser QA    | pending                                   | — |
 | 8 | Ship          | pending — BofA scrub + open-source publish | — |
@@ -110,5 +110,59 @@ shortcut it. Tooling: https://github.com/kunchenguid/firstmate
   mode `live`, source `sandboxdnac.cisco.com`, 4 switches reachable, health 100.
   Porting that proven adapter is very likely better than writing a second one from scratch.
   To be decided at Stage 4, not now.
+
+## STAGE 5 BUILD — "fetch data from Cisco DevNet always-on sandbox" (2026-08-14)
+
+Branch `feat/real-network-sources`. **The simulation is gone.** Every network
+number the squad now says was read from a real Cisco DevNet always-on sandbox
+seconds earlier, or the agent says it is not connected.
+
+### What became real
+| Agent | Source | What it answers with |
+|---|---|---|
+| NetOps | Catalyst Center | live switch inventory, mgmt IPs, software, reachability, health score |
+| Monitor-Eye | Catalyst Center + SD-WAN | live health score, open issues, vManage alarm counts |
+| Incident-Handler | Catalyst Center + ACI | open issues + real critical/major fabric faults |
+| Doc-Writer | all three | writes a real inventory document from live reads |
+| Router-Expert | ACI **or** SD-WAN | fabric nodes/health/tenants + tenant audit; overlay devices/controllers/vEdges/alarms |
+| Config-Keeper | Catalyst Center Command Runner | real `show` output from a real switch, allowlist-guarded |
+| Jarvis | all three | one live overview, per-source, with unreachable sources named |
+
+### Still "not connected" (says so, invents nothing)
+Sentinel (no CVE feed), Firewall-Pro (no FMC), LoadBal-Pro (F5 has no Cisco
+sandbox). Each replies "not connected — needs sandbox credentials".
+
+### Read-only, enforced in code
+- `sources/guardrails.js` — allowlist: only `show / ping / traceroute / dir / more`,
+  and any chained or state-changing keyword (`config`, `write`, `reload`, `|`, `;` …)
+  is rejected. Applied by the caller **and** inside the Catalyst adapter.
+- Any `configure_device` intent is refused before an adapter is touched.
+- The fabricated "NetOps configuration engine" (which pretended to commit config
+  to a device) and every canned BGP/F5/FortiGate/Splunk report were **deleted**,
+  not left dormant — along with the hardcoded `C1sco12345` password that lived in
+  the fake pre-check.
+
+### Files
+- `sources/env.js` — 12-line `.env.local` reader, no new dependency
+- `sources/http.js` — shared HTTPS helper (per-request TLS relaxation)
+- `sources/catalyst-center.js`, `sources/aci.js`, `sources/sdwan.js` — read-only adapters
+- `sources/guardrails.js` — the read-only allowlist
+- `sources/live-agents.js` — turns live reads into the chat messages the dashboard already renders
+- `.env.example` — variable names only, no values
+- New endpoint `GET /api/sources` — which sources are live / unreachable / not connected
+
+### Evidence (live, this session)
+```
+GET /api/sources → catalyst-center live, aci live, sdwan live
+NetOps      → sw1–sw4  C9KV-UADP-8P  10.10.20.175-178  17.12.1prd9  4/4 Reachable  health 100
+Router-Expert (ACI)   → leaf-1, leaf-2 (N9K-C9396PX), spine-1 (N9K-C9508), apic1 · 27 tenants · health 88
+Router-Expert (SD-WAN)→ Manager01, Controller01, Validator01, Edge1-4 · 3 controllers · 30 vEdges · 217 alarms
+Incident-Handler      → 0 Catalyst issues · 121 critical / 5 major real ACI faults
+Config-Keeper         → real `show version` from sw1 ("sw1 uptime is 29 weeks, 1 day…") via Command Runner
+Sentinel/Firewall-Pro/LoadBal-Pro → "not connected — needs sandbox credentials"
+NetOps "configure interface lo10" → refused, read-only, nothing sent to the device
+```
+Secret scan before commit: clean — no credential value or secret pattern in any
+tracked file; `.env.local` absent from `git status`.
 
 Deviations: see implementation-notes.md (to be created at build stage)
