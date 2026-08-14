@@ -32,7 +32,61 @@
 3. Which agents + which connectors in the MVP.
 4. Auth model. 5. What "done" = for the company demo.
 6. **NEW — repo visibility: public vs private?** Blocks the GitHub push. ASKED 2026-08-14.
-7. **NEW — firstmate on Windows?** See blocker below. QUEUED.
+7. ~~firstmate on Windows?~~ **ANSWERED by Vikas 2026-08-14: use Claude Code agents
+   natively.** firstmate is macOS/Linux-only; his PROCESS is what matters, not the tool.
+   Every feature still runs branch → PR → brainstorm → todo → build → a DIFFERENT agent
+   reviews → merge, executed with Claude Code subagents. firstmate-in-WSL not pursued.
+8. **NEW — sandbox coverage gap (see below): which agents become real?** ASKED 2026-08-14.
+
+## Repo (done 2026-08-14, verified)
+Public: https://github.com/vikas53953/mission-control — `main`, initial commit f7930c0,
+7 files, node_modules ignored. Secret scan clean before push. Git identity set repo-local
+(vikas53953) so his global config was left untouched.
+
+## SANDBOX AUDIT — probed live 2026-08-14 (CORRECTED)
+**My earlier "only 4 switches exist" claim was WRONG** — it generalised from the single
+sandbox NetJarvis uses. Vikas corrected me: the DevNet catalogue is much wider (ACI,
+Cat 9200/8000, Umbrella, Secure Network Analytics, SD-WAN, FMC/FTD, ISE, IOS XE/XR,
+Meraki, NSO). I then probed 13 endpoints from his machine. Real results:
+
+| Sandbox | Host | Result |
+|---|---|---|
+| Catalyst Center | sandboxdnac.cisco.com | **LIVE** — token OK, 4 devices sw1–sw4 C9KV-UADP-8P, all Reachable |
+| Catalyst Center 2 | sandboxdnac2.cisco.com | LIVE — token endpoint 200 |
+| ACI APIC | sandboxapicdc.cisco.com | reachable, **login REFUSED** (password rotated) |
+| IOS XE Cat8000 | sandbox-iosxe-latest-1.cisco.com | 401 |
+| IOS XE recommended | sandbox-iosxe-recomm-1.cisco.com | 401 |
+| SD-WAN vManage | sandbox-sdwan-2.cisco.com | returns login HTML, not data |
+| FMC | fmcrestapisandbox.cisco.com | 401 |
+| Meraki | api.meraki.com | 401 (old public sandbox key dead) |
+| Umbrella | api.umbrella.com | 401 (always needed an org key) |
+| IOS XR | sandbox-iosxr-1.cisco.com | TIMEOUT on 443 — retired or moved |
+| NSO | sandbox-nso-1.cisco.com | not RESTCONF on 443 — wrong port |
+| ISE | sandboxise.cisco.com | DNS does not resolve — hostname was my guess |
+
+**Root cause of the 401s: DevNet moved always-on labs to per-user dynamic credentials.**
+Hosts are alive; the old shared passwords no longer authenticate. This is a credentials
+problem, not a coverage problem. Only Vikas can fix it (credentials sit behind his login).
+
+**BLOCKER → Vikas to supply current credentials from devnetsandbox.cisco.com**, plus the
+correct hostnames for ISE and IOS XR. Not needed all at once — Catalyst Center works today.
+
+Probe scripts: `scratchpad/probe-devnet.js`, `scratchpad/probe2.js`.
+Review page (with feedback layer): https://claude.ai/code/artifact/1574877a-8607-4f3b-be98-d8f78faa4e1d
+
+## Agent → sandbox mapping (proposed, awaiting Vikas)
+Real today via Catalyst Center: **netops, monitor-eye, incident-handler, doc-writer, jarvis**.
+Need credentials: **router-expert** (IOS XE), **config-keeper** (IOS XE running-config),
+**firewall-pro** (FMC), **sentinel** (Umbrella).
+No Cisco equivalent: **loadbal-pro** (F5 is not Cisco) — Vikas said he will explain these himself.
+NEW agents to create: **aci-expert, nexus-expert, sdwan-expert, umbrella-guard, ise-expert,
+meraki-expert**.
+
+## Build shape (proposed)
+One pluggable source module per sandbox behind a shared interface (the pattern NetJarvis
+proved). Credentials in gitignored `.env.local` — **the repo is PUBLIC, so this is mandatory**.
+An agent without working credentials must say "not connected", never invent data.
+Read-only enforced in code. One sandbox per branch/PR.
 
 ## Vikas's standing workflow for this project (stated 2026-08-14)
 Every new feature runs: **new branch → PR → brainstorm → todo list → build (using
