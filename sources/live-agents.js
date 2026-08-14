@@ -1,0 +1,396 @@
+// Live agent answers — every line of network data below comes from a real
+// Cisco DevNet always-on sandbox. Nothing here invents a device, a number or a
+// status. If a sandbox cannot be reached the agent says so and stops.
+//
+// Backends in play:
+//   Catalyst Center (sandboxdnac.cisco.com)   — campus switches, health, issues
+//   ACI / APIC       (sandboxapicdc.cisco.com) — Nexus fabric, tenants, faults
+//   SD-WAN vManage   (sandbox-sdwan-2.cisco.com) — overlay routers, alarms
+//
+// Agents with no backend say "not connected" — they never fall back to canned
+// reports.
+const catalyst = require('./catalyst-center');
+const aci = require('./aci');
+const sdwan = require('./sdwan');
+const { checkCommand } = require('./guardrails');
+
+// The host app injects its broadcast/status/task-board plumbing here so this
+// module stays free of server internals.
+let ctx = null;
+function init(hostCtx) { ctx = hostCtx; }
+
+const say = (agentId, text) => ctx.say(agentId, text);
+const RULE = '──────────────────────────────────';
+
+// Agents that have no sandbox behind them. Honest answer, every time.
+const NO_BACKEND = {
+  'sentinel': 'CVE / threat-feed source (Cisco Umbrella or Talos)',
+  'firewall-pro': 'firewall source (Cisco Secure Firewall / FMC)',
+  'loadbal-pro': 'load-balancer source (F5 — no Cisco DevNet equivalent)',
+};
+
+function notConnected(agentId) {
+  const need = NO_BACKEND[agentId] || 'a live data source';
+  say(agentId,
+    `🔌 Not connected — needs sandbox credentials.\n${RULE}\n` +
+    `I have no ${need} wired up, so I have nothing real to report.\n` +
+    `I will not make up a report. Add the credentials to .env.local and I will answer for real.`);
+  ctx.updateAgentStatus(agentId, 'idle', 'Not connected — no data source');
+}
+
+// Every live answer runs through here: task board in, honest failure out.
+async function runLive(agentId, taskTitle, busyLabel, worker) {
+  const agent = ctx.agents[agentId];
+  ctx.updateAgentStatus(agentId, 'active', busyLabel);
+  ctx.addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
+  try {
+    await worker();
+    ctx.appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ${taskTitle} — live data returned\n`);
+    ctx.updateAgentStatus(agentId, 'idle', `${taskTitle} complete (live data)`);
+  } catch (err) {
+    say(agentId,
+      `⚠️ Source unreachable.\n${RULE}\n${err.message}\n\n` +
+      `No data to show. I am not going to guess what the network looks like.`);
+    ctx.appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ${taskTitle} FAILED — ${err.message}\n`);
+    ctx.updateAgentStatus(agentId, 'idle', 'Source unreachable');
+  }
+  ctx.moveTaskOnBoard(taskTitle, 'inProgress', 'done');
+}
+
+const pad = (s, n) => String(s == null ? '' : s).padEnd(n);
+
+// ── NetOps — real campus inventory from Catalyst Center ──────────────────────
+async function netops(agentId, command) {
+  await runLive(agentId, 'Device health check', 'Querying Catalyst Center', async () => {
+    say(agentId, `🌐 Connecting to Cisco Catalyst Center — ${catalyst.host} (read-only)...`);
+    const devices = await catalyst.getDevices();
+    const health = await catalyst.getHealth().catch(() => null);
+
+    const rows = devices.map((d) =>
+      `${pad(d.hostname, 10)} ${pad(d.ip, 16)} ${pad(d.platform, 16)} ${pad(d.reachability, 12)} ${d.software || ''}`);
+
+    say(agentId,
+      `📡 Live inventory — ${devices.length} device(s)\n${RULE}\n` +
+      `${pad('HOST', 10)} ${pad('MGMT IP', 16)} ${pad('PLATFORM', 16)} ${pad('REACHABLE', 12)} VERSION\n` +
+      (rows.join('\n') || 'no devices returned'));
+
+    const down = devices.filter((d) => d.reachability !== 'Reachable');
+    say(agentId,
+      `✅ Health check complete\n${RULE}\n` +
+      `🟢 Reachable: ${devices.length - down.length}/${devices.length}\n` +
+      (down.length ? `🔴 Not reachable: ${down.map((d) => d.hostname).join(', ')}\n` : '') +
+      (health ? `📊 Fabric health score: ${health.score} (good ${health.good} / bad ${health.bad})\n` : '') +
+      `\nSource: ${catalyst.label} — ${catalyst.host}. Read-only.`);
+  });
+}
+
+// ── Monitor-Eye — real health + issues + SD-WAN alarm counts ─────────────────
+async function monitorEye(agentId) {
+  await runLive(agentId, 'Alert sweep', 'Pulling live alerts', async () => {
+    say(agentId, `👁️ Pulling live alerts from ${catalyst.host} and ${sdwan.host || 'vManage (not configured)'}...`);
+
+    const health = await catalyst.getHealth();
+    const issues = await catalyst.getIssues();
+    say(agentId,
+      `📊 Catalyst Center — network health\n${RULE}\n` +
+      `Overall score: ${health.score}\nDevices monitored: ${health.total}\n` +
+      `🟢 Good: ${health.good}   🔴 Bad: ${health.bad}   ⚫ Unmonitored: ${health.unmonitored ?? 0}\n` +
+      `Open issues: ${issues.length}` +
+      (issues.length ? '\n' + issues.slice(0, 6).map((i) => `  ${i.priority} · ${i.name} (${i.status})`).join('\n') : ''));
+
+    // vManage lives on its own credentials — report it separately so one dead
+    // source cannot take the whole answer down.
+    try {
+      const alarms = await sdwan.getAlarmCount();
+      say(agentId, `🚨 SD-WAN (vManage ${sdwan.host}) — active alarms: ${alarms.active}, cleared: ${alarms.raw?.cleared_count ?? 'n/a'}`);
+    } catch (e) {
+      say(agentId, `⚠️ SD-WAN alarm feed unreachable — ${e.message}. Catalyst Center figures above are still live.`);
+    }
+
+    say(agentId, `✅ Alert sweep complete. All figures read live — no thresholds simulated.`);
+  });
+}
+
+// ── Incident-Handler — real open issues + real ACI faults ────────────────────
+async function incidentHandler(agentId) {
+  await runLive(agentId, 'Incident triage', 'Triaging live issues', async () => {
+    say(agentId, `🚨 Checking real incidents across Catalyst Center and the ACI fabric...`);
+
+    const issues = await catalyst.getIssues();
+    say(agentId,
+      `📋 Catalyst Center open issues: ${issues.length}\n${RULE}\n` +
+      (issues.length
+        ? issues.slice(0, 8).map((i) => `${i.priority} · ${i.name}\n   category ${i.category} · seen ${i.occurrences}x · ${i.status}`).join('\n')
+        : 'No open issues reported by Catalyst Center right now.'));
+
+    try {
+      const faults = await aci.getFaults(['critical', 'major']);
+      const crit = faults.filter((f) => f.severity === 'critical');
+      say(agentId,
+        `🔥 ACI fabric faults (${aci.host}) — ${crit.length} critical, ${faults.length - crit.length} major\n${RULE}\n` +
+        (faults.length
+          ? faults.slice(0, 6).map((f) =>
+              `[${f.severity}] F${f.code} · ${f.tenant === 'unknown' ? 'fabric-level' : 'tenant ' + f.tenant}` +
+              `\n   ${String(f.description || '').slice(0, 120)}`).join('\n')
+          : 'No critical or major faults.'));
+    } catch (e) {
+      say(agentId, `⚠️ ACI fault feed unreachable — ${e.message}. Catalyst Center figures above are still live.`);
+    }
+
+    say(agentId, `✅ Triage complete — every item above is a real fault or issue read from the sandbox.`);
+  });
+}
+
+// ── Doc-Writer — writes a real inventory document from live data ─────────────
+async function docWriter(agentId) {
+  await runLive(agentId, 'Network inventory document', 'Writing live inventory doc', async () => {
+    say(agentId, `📝 Building a network inventory document from live sources...`);
+
+    const lines = [`# Network Inventory (live)`, ``, `Generated: ${new Date().toISOString()}`, ``];
+    let anySource = false;
+
+    try {
+      const devices = await catalyst.getDevices();
+      anySource = true;
+      lines.push(`## Campus — ${catalyst.label} (${catalyst.host})`, ``,
+        `| Host | Mgmt IP | Platform | Role | Software | Reachability |`,
+        `|---|---|---|---|---|---|`,
+        ...devices.map((d) => `| ${d.hostname} | ${d.ip} | ${d.platform} | ${d.role} | ${d.software} | ${d.reachability} |`), ``);
+      say(agentId, `✓ Catalyst Center: ${devices.length} devices — ${devices.map((d) => d.hostname).join(', ')}`);
+    } catch (e) {
+      lines.push(`## Campus — Catalyst Center`, ``, `Source unreachable: ${e.message}`, ``);
+      say(agentId, `⚠️ Catalyst Center unreachable — ${e.message}`);
+    }
+
+    try {
+      const nodes = await aci.getFabricNodes();
+      const tenants = await aci.getTenants();
+      anySource = true;
+      lines.push(`## Data centre — ${aci.label} (${aci.host})`, ``,
+        `| Node | Model | Role | State | Version |`, `|---|---|---|---|---|`,
+        ...nodes.map((n) => `| ${n.name} | ${n.model || '-'} | ${n.role} | ${n.state} | ${n.version || '-'} |`),
+        ``, `Tenants: ${tenants.length} — ${tenants.map((t) => t.name).join(', ')}`, ``);
+      say(agentId, `✓ ACI: ${nodes.length} fabric nodes — ${nodes.map((n) => n.name).join(', ')}; ${tenants.length} tenants`);
+    } catch (e) {
+      lines.push(`## Data centre — ACI`, ``, `Source unreachable: ${e.message}`, ``);
+      say(agentId, `⚠️ ACI unreachable — ${e.message}`);
+    }
+
+    try {
+      const devices = await sdwan.getDevices();
+      anySource = true;
+      lines.push(`## WAN — ${sdwan.label} (${sdwan.host})`, ``,
+        `| Host | System IP | Type | State |`, `|---|---|---|---|`,
+        ...devices.map((d) => `| ${d.hostname} | ${d.systemIp || '-'} | ${d.type} | ${d.state} |`), ``);
+      say(agentId, `✓ SD-WAN: ${devices.length} devices — ${devices.map((d) => d.hostname).join(', ')}`);
+    } catch (e) {
+      lines.push(`## WAN — SD-WAN`, ``, `Source unreachable: ${e.message}`, ``);
+      say(agentId, `⚠️ SD-WAN unreachable — ${e.message}`);
+    }
+
+    if (!anySource) throw new Error('every source was unreachable — nothing real to document');
+
+    const file = ctx.writeReport(agentId, `network-inventory-${Date.now()}.md`, lines.join('\n'));
+    say(agentId, `✅ Document written from live data.\n📁 ${file}\n\nEvery row above was read from a sandbox — nothing typed by hand.`);
+  });
+}
+
+// ── Router-Expert — ACI fabric (Nexus) or SD-WAN overlay ────────────────────
+const ACI_WORDS = /\b(aci|apic|fabric|tenant|epg|bridge[\s-]?domain|bd\b|vrf|contract|leaf|spine|nexus|n9k)\b/i;
+
+async function routerExpert(agentId, command) {
+  if (ACI_WORDS.test(command || '')) return routerExpertAci(agentId, command);
+  return routerExpertSdwan(agentId);
+}
+
+async function routerExpertAci(agentId, command) {
+  await runLive(agentId, 'ACI fabric check', 'Querying APIC', async () => {
+    say(agentId, `🔀 Querying the ACI fabric — ${aci.host} (read-only)...`);
+
+    const nodes = await aci.getFabricNodes();
+    const health = await aci.getFabricHealth().catch(() => ({ score: null }));
+    say(agentId,
+      `📡 Fabric nodes — ${nodes.length}\n${RULE}\n` +
+      `${pad('NODE', 10)} ${pad('MODEL', 16)} ${pad('ROLE', 12)} ${pad('STATE', 14)} VERSION\n` +
+      nodes.map((n) => `${pad(n.name, 10)} ${pad(n.model || '-', 16)} ${pad(n.role, 12)} ${pad(n.state, 14)} ${n.version || '-'}`).join('\n') +
+      (health.score != null
+        ? `\n\n📊 Fabric health: ${health.score}${health.previous ? ` (previous reading ${health.previous})` : ''}`
+        : ''));
+
+    // If the question names a tenant, run the real read-only audit on it.
+    const named = /tenant\s+([A-Za-z0-9_.:-]+)/i.exec(command || '');
+    if (named) {
+      const name = named[1];
+      say(agentId, `🔎 Auditing tenant "${name}" — walking VRF → BD → EPG → contract for missing links...`);
+      const audit = await aci.auditTenant(name);
+      say(agentId,
+        `📋 Tenant ${audit.tenant}\n${RULE}\n` +
+        `VRFs ${audit.counts.vrfs} · BDs ${audit.counts.bridgeDomains} · App profiles ${audit.counts.appProfiles} · EPGs ${audit.counts.epgs} · Contracts ${audit.counts.contracts}\n\n` +
+        (audit.findings.bdWithoutVrf.length ? `⚠️ Bridge domains with no VRF: ${audit.findings.bdWithoutVrf.join(', ')}\n` : '') +
+        (audit.findings.epgWithoutBd.length ? `⚠️ EPGs with no bridge domain: ${audit.findings.epgWithoutBd.join(', ')}\n` : '') +
+        (audit.findings.epgWithoutContract.length ? `⚠️ EPGs with no contract either way: ${audit.findings.epgWithoutContract.join(', ')}\n` : '') +
+        (audit.faults.length ? `🔥 Faults: ${audit.faults.length}\n` : '') +
+        (audit.clean ? '✅ Nothing incomplete found in this tenant.' : ''));
+    } else {
+      const tenants = await aci.getTenants();
+      say(agentId, `🏢 Tenants — ${tenants.length}: ${tenants.map((t) => t.name).join(', ')}\n\nAsk me "audit tenant <name>" and I will walk its VRF/BD/EPG/contract links for real.`);
+    }
+
+    say(agentId, `✅ Read-only fabric check complete. Source: ${aci.label} — ${aci.host}.`);
+  });
+}
+
+async function routerExpertSdwan(agentId) {
+  await runLive(agentId, 'SD-WAN overlay check', 'Querying vManage', async () => {
+    say(agentId, `🔀 Querying the SD-WAN overlay — vManage ${sdwan.host} (read-only)...`);
+
+    const devices = await sdwan.getDevices();
+    say(agentId,
+      `📡 Overlay devices — ${devices.length}\n${RULE}\n` +
+      `${pad('HOST', 14) } ${pad('SYSTEM IP', 16)} ${pad('TYPE', 10)} ${pad('STATE', 12)} MODEL\n` +
+      devices.map((d) => `${pad(d.hostname, 14)} ${pad(d.systemIp || '-', 16)} ${pad(d.type, 10)} ${pad(d.state, 12)} ${d.model || '-'}`).join('\n'));
+
+    const controllers = await sdwan.getControllers();
+    const vedges = await sdwan.getVedges();
+    const alarms = await sdwan.getAlarmCount().catch(() => ({ active: 'n/a' }));
+
+    say(agentId,
+      `✅ Overlay summary\n${RULE}\n` +
+      `🎛  Controllers: ${controllers.length} — ${controllers.map((c) => c.hostname).join(', ')}\n` +
+      `🛰  vEdges in inventory: ${vedges.length}\n` +
+      `🚨 Active alarms: ${alarms.active}\n\n` +
+      `Source: ${sdwan.label} — ${sdwan.host}. Read-only.\n` +
+      `(Ask about ACI, fabric, leaf/spine or a tenant and I will switch to the APIC.)`);
+  });
+}
+
+// ── Config-Keeper — real show output via Catalyst Center Command Runner ──────
+// This is the one path that touches a device CLI, so it is the strictest:
+// the guardrail allowlist runs before the request is built.
+async function configKeeper(agentId, command) {
+  const wanted = extractShowCommand(command);
+
+  const verdict = checkCommand(wanted);
+  if (!verdict.allowed) {
+    say(agentId, `🚫 ${verdict.reason}\n\nThis squad is read-only against real kit by design. I can run show / ping / traceroute and nothing else.`);
+    ctx.updateAgentStatus(agentId, 'idle', 'Blocked a non-read-only command');
+    return;
+  }
+
+  await runLive(agentId, 'Config read', `Running "${verdict.command}"`, async () => {
+    say(agentId, `📋 Guardrail check passed for "${verdict.command}" (read-only verb).\nSubmitting to Catalyst Center Command Runner — ${catalyst.host}...`);
+
+    const devices = await catalyst.getDevices();
+    const target = devices.find((d) => d.reachability === 'Reachable');
+    if (!target) throw new Error('no reachable device to read from');
+
+    say(agentId, `🎯 Target: ${target.hostname} (${target.ip}, ${target.platform}). Sandbox Command Runner is slow — this can take up to a minute.`);
+
+    const file = await catalyst.runShowCommand([target.id], verdict.command);
+    const out = extractCommandOutput(file, verdict.command);
+    const body = out ? String(out.text).slice(0, 2000) : JSON.stringify(file).slice(0, 1200);
+    say(agentId,
+      `📡 ${target.hostname} — ${verdict.command}\n${RULE}\n${body}\n${RULE}\n` +
+      (out && out.ok === false
+        ? `⚠️ The device rejected that command. Real output above — nothing was invented, and no configuration was sent.`
+        : `Real output, read live. No configuration was sent.`));
+  });
+}
+
+// Pull the actual CLI command out of plain English. People type
+// "show version on the switches" — the device only understands "show version",
+// so the trailing English is trimmed off before anything is submitted.
+function extractShowCommand(text) {
+  const m = /\b((?:show|ping|traceroute)\b[\w\s|:/.\-]*)/i.exec(text || '');
+  if (!m) return 'show version';
+  return m[1]
+    .replace(/\s+(on|for|from|of|across|in|to|please)\b.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim() || 'show version';
+}
+
+// Command Runner returns a nested envelope with SUCCESS / FAILURE /
+// BLOCKLISTED buckets. Read all three so a device error is reported as a
+// device error, not dumped as raw JSON.
+function extractCommandOutput(file, command) {
+  try {
+    const entry = Array.isArray(file) ? file[0] : file;
+    const r = entry?.commandResponses || {};
+    const pick = (bucket) => {
+      const keys = Object.keys(bucket || {});
+      return keys.length ? bucket[keys[0]] : null;
+    };
+    const ok = pick(r.SUCCESS || r.success);
+    if (ok) return { ok: true, text: ok };
+    const failed = pick(r.FAILURE || r.failure);
+    if (failed) return { ok: false, text: failed };
+    const blocked = pick(r.BLOCKLISTED || r.blocklisted);
+    if (blocked) return { ok: false, text: `Catalyst Center blocklisted this command: ${blocked}` };
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+// ── Jarvis — one honest picture across every source ─────────────────────────
+async function jarvisNetwork(agentId) {
+  await runLive(agentId, 'Network overview', 'Polling all sources', async () => {
+    say(agentId, `🎖️ Polling every connected source for a real picture...`);
+    const lines = [];
+
+    try {
+      const devices = await catalyst.getDevices();
+      const health = await catalyst.getHealth();
+      const up = devices.filter((d) => d.reachability === 'Reachable').length;
+      lines.push(`🟢 Campus (Catalyst Center, ${catalyst.host})\n   ${up}/${devices.length} reachable — ${devices.map((d) => d.hostname).join(', ')}\n   Health score ${health.score}`);
+    } catch (e) { lines.push(`🔴 Campus (Catalyst Center) — unreachable: ${e.message}`); }
+
+    try {
+      const nodes = await aci.getFabricNodes();
+      const health = await aci.getFabricHealth();
+      const faults = await aci.getFaults(['critical']);
+      lines.push(`🟢 Data centre (ACI, ${aci.host})\n   ${nodes.length} fabric nodes — ${nodes.map((n) => n.name).join(', ')}\n   Fabric health ${health.score} · ${faults.length} critical faults`);
+    } catch (e) { lines.push(`🔴 Data centre (ACI) — unreachable: ${e.message}`); }
+
+    try {
+      const devices = await sdwan.getDevices();
+      const alarms = await sdwan.getAlarmCount();
+      lines.push(`🟢 WAN (SD-WAN vManage, ${sdwan.host})\n   ${devices.length} devices — ${devices.map((d) => d.hostname).join(', ')}\n   ${alarms.active} active alarms`);
+    } catch (e) { lines.push(`🔴 WAN (SD-WAN) — unreachable: ${e.message}`); }
+
+    lines.push(`⚪ Not connected: Sentinel (CVE feed), Firewall-Pro (firewall), LoadBal-Pro (F5) — no credentials, so they report nothing rather than guessing.`);
+
+    say(agentId, `📊 **Live network overview**\n${RULE}\n${lines.join('\n\n')}\n${RULE}\nEverything above was read from a Cisco DevNet always-on sandbox just now.`);
+  });
+}
+
+// ── Read-only refusal for any change request ────────────────────────────────
+function refuseWrite(agentId, command) {
+  say(agentId,
+    `🚫 Read-only. I will not change device configuration.\n${RULE}\n` +
+    `You asked: "${String(command).slice(0, 100)}"\n\n` +
+    `This squad is wired to real Cisco DevNet sandboxes with read-only access enforced in code — ` +
+    `only show / ping / traceroute reads are allowed through. Nothing was sent to any device.`);
+  ctx.updateAgentStatus(agentId, 'idle', 'Refused a write — read-only mode');
+}
+
+// Which agent answers from which live source.
+const HANDLERS = {
+  'netops': netops,
+  'monitor-eye': monitorEye,
+  'incident-handler': incidentHandler,
+  'doc-writer': docWriter,
+  'router-expert': routerExpert,
+  'config-keeper': configKeeper,
+  'jarvis': jarvisNetwork,
+};
+
+function hasLiveBackend(agentId) { return Boolean(HANDLERS[agentId]); }
+
+// Entry point used by the dispatcher in server.js.
+function handle(agentId, command) {
+  if (NO_BACKEND[agentId]) return notConnected(agentId);
+  const fn = HANDLERS[agentId];
+  if (!fn) return notConnected(agentId);
+  return fn(agentId, command);
+}
+
+module.exports = { init, handle, refuseWrite, notConnected, hasLiveBackend, NO_BACKEND };

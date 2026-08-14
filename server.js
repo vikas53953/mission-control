@@ -1,3 +1,7 @@
+// Load .env.local FIRST — the sandbox adapters read their credentials from
+// process.env at require time. The repo is public; .env.local is gitignored.
+require('./sources/env');
+
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const chokidar = require('chokidar');
@@ -5,6 +9,11 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+
+const live = require('./sources/live-agents');
+const catalyst = require('./sources/catalyst-center');
+const aci = require('./sources/aci');
+const sdwan = require('./sources/sdwan');
 
 const app = express();
 const PORT = 3000;
@@ -177,6 +186,34 @@ function broadcast(type, data) {
     }
   });
 }
+
+// Hand the live-source layer the plumbing it needs to talk to the dashboard.
+// It stays out of server internals; this is the only seam between them.
+live.init({
+  agents,
+  say(agentId, text) {
+    const a = agents[agentId] || {};
+    broadcast('chat_message', {
+      type: 'incoming',
+      agent: agentId,
+      agentName: a.name || agentId,
+      agentIcon: a.icon || '🤖',
+      text,
+      timestamp: new Date().toISOString(),
+    });
+  },
+  updateAgentStatus,
+  addTaskToBoard,
+  moveTaskOnBoard,
+  appendToActivityLog,
+  writeReport(agentId, filename, content) {
+    const dir = path.join(SQUAD_ROOT, 'agents', agentId, 'reports');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const full = path.join(dir, filename);
+    fs.writeFileSync(full, content);
+    return filename;
+  },
+});
 
 // WebSocket connection handler
 wss.on('connection', (ws) => {
@@ -388,25 +425,18 @@ function generateMentionResponse(responderId, fromId, message) {
       `@${from.name} On it — initiating device connectivity tests.`,
       `@${from.name} Acknowledged. Pulling latest device metrics.`
     ],
+    // No backend wired up — say so rather than promise a report we cannot make.
     'sentinel': [
-      `@${from.name} Scanning threat feeds and CVE databases now.`,
-      `@${from.name} Copy. Checking FortiGuard and NVD for advisories.`,
-      `@${from.name} Acknowledged. Running security posture assessment.`
+      `@${from.name} I'm not connected to a CVE feed yet — no credentials, so I have nothing real to report.`
     ],
     'firewall-pro': [
-      `@${from.name} Reviewing firewall policies and NAT rules.`,
-      `@${from.name} On it — checking FortiGate config and rule base.`,
-      `@${from.name} Acknowledged. Analyzing firewall change impact.`
+      `@${from.name} I'm not connected to a firewall source yet — no credentials, so I have nothing real to report.`
     ],
     'loadbal-pro': [
-      `@${from.name} Checking F5 pool status and health monitors.`,
-      `@${from.name} Roger — reviewing VIP configurations and SSL profiles.`,
-      `@${from.name} On it. Pulling F5 LTM/GTM status.`
+      `@${from.name} I'm not connected to a load balancer — F5 has no Cisco DevNet sandbox. Nothing real to report.`
     ],
     'router-expert': [
-      `@${from.name} Checking BGP/OSPF adjacencies and routing tables.`,
-      `@${from.name} Acknowledged. Reviewing routing topology.`,
-      `@${from.name} On it — analyzing route convergence.`
+      `@${from.name} On it — querying the live ACI fabric / SD-WAN overlay.`
     ],
     'monitor-eye': [
       `@${from.name} Checking Splunk dashboards and SNMP alerts.`,
@@ -496,678 +526,33 @@ function detectAgentIntent(agentId, command) {
   return 'general';
 }
 
-// Route a generic "status" query to the agent's own domain
-function simulateAgentDomainStatus(agentId, command) {
-  const domainMap = {
-    'router-expert':    () => simulateBGPStatus(agentId),
-    'sentinel':         () => simulateSecurityScan(agentId, command),
-    'firewall-pro':     () => simulateFirewallCheck(agentId, command),
-    'loadbal-pro':      () => simulateLBCheck(agentId, command),
-    'monitor-eye':      () => simulateAlertCheck(agentId, command),
-    'config-keeper':    () => simulateConfigCheck(agentId, command),
-    'incident-handler': () => simulateIncidentCheck(agentId, command),
-    'netops':           () => simulatePrecheck(agentId, command),
-  };
-  const fn = domainMap[agentId];
-  if (fn) fn(); else simulateStatusCheck(agentId);
-}
 
-// When input doesn't match any pattern, agent interprets it contextually
-function simulateAgentIntelligentResponse(agentId, command) {
-  const agent = agents[agentId];
-  const contextual = {
-    'netops':           `🌐 Got it. Interpreting as a network ops request — analyzing intent and preparing action...`,
-    'sentinel':         `🛡️ Understood. Treating this as a security request — launching threat assessment...`,
-    'firewall-pro':     `🔥 On it. Interpreting as a firewall request — pulling policy base and FortiGate config...`,
-    'loadbal-pro':      `⚖️ Roger. Treating this as a load balancer request — checking F5 pools and VIPs...`,
-    'router-expert':    `🔀 Got it. Interpreting as a routing request — checking BGP peers and routing table...`,
-    'monitor-eye':      `👁️ Understood. Treating this as a monitoring request — pulling latest Splunk alerts and SNMP traps...`,
-    'config-keeper':    `📋 On it. Interpreting as a config request — running compliance and drift check...`,
-    'incident-handler': `🚨 Got it. Treating this as an incident request — checking active incidents and RCA log...`,
-    'doc-writer':       `📝 Understood. I'll draft documentation based on: "${command.slice(0, 60)}..."`,
-  };
-
-  setTimeout(() => {
-    broadcast('chat_message', {
-      type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-      text: contextual[agentId] || `🤖 Processing: "${command}"...`,
-      timestamp: new Date().toISOString()
-    });
-  }, 350);
-
-  // Follow through with the domain check
-  setTimeout(() => simulateAgentDomainStatus(agentId, command), 1800);
-}
-
-// ── Router-Expert: BGP + routing status ──────────────────────────────────────
-function simulateBGPStatus(agentId) {
-  const agent = agents[agentId];
-  const taskTitle = 'BGP Status Check';
-  updateAgentStatus(agentId, 'active', 'Checking BGP status');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  const steps = [
-    { delay: 400,  msg: '🔗 Connecting to core routers...' },
-    { delay: 1100, msg: '📡 show bgp summary\n──────────────────────────────────\nBGP router identifier: 1.1.1.1   Local AS: 65001\nBGP table version: 526\n\nNeighbor        V  AS       State          Up/Down     PfxRcd\n10.0.0.1        4  65002    Established    3d 01:12      150\n10.0.0.2        4  65003    Established    5d 12:44      200\n10.0.0.3        4  65004    Established    2d 07:03      175\n10.0.0.4        4  65005    Idle(Admin)    never           0' },
-    { delay: 2500, msg: '📡 show bgp ipv4 unicast statistics\n──────────────────────────────────\nRIB entries:    875     Memory: 546 KB\nPeers:          3 Established, 1 Idle\nPfx received:   525     Pfx advertised: 525' },
-    { delay: 3700, msg: '📡 show ip route summary\n──────────────────────────────────\nRoute Source       Routes\nconnected          3\nstatic             1\nbgp 65001          525\nospf 1             47\n──────────────────────────────────\nTotal:             576 routes' },
-    { delay: 5000, msg: '✅ BGP Status Report\n──────────────────────────────────\n🟢 Peers UP:    3  (AS65002 · AS65003 · AS65004)\n🔴 Peers DOWN:  1  (AS65005 — Admin shutdown)\n📊 Prefixes:    525 received / 525 advertised\n⏱  Best uptime: 5d 12h (AS65003)\n\n⚠️  Peer 10.0.0.4 (AS65005) is admin-shutdown.\n   Verify with Vikas before clearing — may be intentional.' },
-  ];
-
-  steps.forEach(s => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: s.msg, timestamp: new Date().toISOString()
-      });
-      updateAgentStatus(agentId, 'active', 'BGP check in progress');
-    }, s.delay);
-  });
-
-  setTimeout(() => {
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] BGP status check complete — 3/4 peers UP\n`);
-    updateAgentStatus(agentId, 'idle', 'BGP check complete — 3/4 peers UP');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 5600);
-}
-
-// ── Sentinel: Security / CVE scan ────────────────────────────────────────────
-function simulateSecurityScan(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = 'Security & CVE Scan';
-  updateAgentStatus(agentId, 'active', 'Running security scan');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  const steps = [
-    { delay: 300,  msg: '🔍 Initiating security scan...' },
-    { delay: 1000, msg: '📡 Querying threat feeds...\n  ✓ FortiGuard Labs\n  ✓ NIST NVD\n  ✓ CISA KEV database\n  ✓ CVE Mitre' },
-    { delay: 2400, msg: '⚠️  CVE Findings:\n──────────────────────────────────\nCVE-2024-21762  FortiOS SSL-VPN  CRITICAL (9.8)\n  Auth bypass via crafted HTTP request\n  Affected: FortiOS 7.0.x < 7.0.14\n  Status: ❌ Patch NOT YET applied\n\nCVE-2023-27997  FortiOS SSL-VPN  CRITICAL (9.8)\n  Heap buffer overflow\n  Affected: FortiOS < 7.2.5\n  Status: ✅ PATCHED' },
-    { delay: 3800, msg: '📊 Threat Posture Summary:\n──────────────────────────────────\n🔴 Critical (unpatched): 1\n🟠 High (patched):        3\n🟡 Medium:                7\n🟢 Low:                  12\n\n📋 Recommendation: Apply FortiOS 7.0.14 patch immediately.\n   Routing to Firewall-Pro for remediation.' },
-  ];
-
-  steps.forEach(s => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: s.msg, timestamp: new Date().toISOString()
-      });
-    }, s.delay);
-  });
-
-  setTimeout(() => {
-    handleMention(agentId, 'firewall-pro', 'CVE-2024-21762 is unpatched on FortiGate. Please verify FortiOS version and schedule update to 7.0.14.');
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Security scan complete — 1 critical CVE unpatched\n`);
-    updateAgentStatus(agentId, 'idle', 'Scan complete — 1 critical CVE unpatched');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 5000);
-}
-
-// ── Firewall-Pro: Policy and FortiGate check ─────────────────────────────────
-function simulateFirewallCheck(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = 'Firewall Policy Check';
-  updateAgentStatus(agentId, 'active', 'Checking FortiGate');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  const steps = [
-    { delay: 350,  msg: '🔥 Connecting to FortiGate-600E...' },
-    { delay: 1100, msg: `📡 get system status\n──────────────────────────────────\nModel:     FortiGate-600E\nFirmware:  FortiOS v7.0.13 build0566\nSerial:    FGT600E1234567\nHA Mode:   Standalone\nUptime:    48 days 03:22:11` },
-    { delay: 2300, msg: '📡 show firewall policy | grep policyid\n──────────────────────────────────\nTotal policies: 142  |  Enabled: 138  |  Disabled: 4' },
-    { delay: 3300, msg: '📡 Top hit policies (last 24h):\n──────────────────────────────────\nID 10  ALLOW LAN→WAN      48,293 hits\nID 22  ALLOW VPN→DMZ      12,841 hits\nID 35  BLOCK TOR-exits      1,204 blocked\nID 78  ALLOW DMZ→DB         3,891 hits' },
-    { delay: 4500, msg: '✅ FortiGate Summary\n──────────────────────────────────\n🟢 Policies:   142 total, 138 active\n🟢 VPN:        14 tunnels UP, 0 DOWN\n🟠 FortiOS:    v7.0.13 — v7.0.14 available\n🟢 IPS:        Enabled  |  AV: Enabled\n\n⚠️  FortiOS 7.0.14 patches CVE-2024-21762 (Critical).\n   Schedule maintenance window to apply update.' },
-  ];
-
-  steps.forEach(s => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: s.msg, timestamp: new Date().toISOString()
-      });
-    }, s.delay);
-  });
-
-  setTimeout(() => {
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Firewall check complete — patch needed\n`);
-    updateAgentStatus(agentId, 'idle', 'Firewall check complete — patch pending');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 5200);
-}
-
-// ── LoadBal-Pro: F5 BIG-IP check ─────────────────────────────────────────────
-function simulateLBCheck(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = 'F5 LTM Status Check';
-  updateAgentStatus(agentId, 'active', 'Checking F5 BIG-IP');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  const steps = [
-    { delay: 400,  msg: '⚖️ Connecting to F5 BIG-IP...' },
-    { delay: 1100, msg: '📡 show sys version\n──────────────────────────────────\nBIG-IP LTM  Version: 16.1.3.3\nHostname: bigip01.corp.local\nUptime:   12 days 07:14' },
-    { delay: 2200, msg: '📡 show ltm pool\n──────────────────────────────────\nPool Name          Members  Active  Status\npool_web_443       4        4       ✅ Available\npool_api_8080      3        3       ✅ Available\npool_db_3306       2        2       ✅ Available\npool_legacy_80     2        1       ⚠️  Degraded\npool_admin_8443    2        2       ✅ Available' },
-    { delay: 3400, msg: '📡 show ltm virtual (degraded only)\n──────────────────────────────────\nVIP 10.10.1.102:80  pool_legacy_80  ⚠️  Degraded\n  Member 10.0.2.45:80 — Connection refused\n  Member 10.0.2.46:80 — ✅ Available' },
-    { delay: 4600, msg: '✅ F5 LTM Report\n──────────────────────────────────\n🟢 VIPs:        5 total, 4 fully available\n⚠️  Degraded:    pool_legacy_80 (1/2 members down)\n🟢 SSL certs:   All valid, no expiry in 30d\n🟢 System:      CPU 12%  |  Memory 34%\n\n📋 Action: NetOps to check 10.0.2.45:80 — may be process crash or firewall rule.' },
-  ];
-
-  steps.forEach(s => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: s.msg, timestamp: new Date().toISOString()
-      });
-    }, s.delay);
-  });
-
-  setTimeout(() => {
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] F5 check complete — 1 degraded pool\n`);
-    updateAgentStatus(agentId, 'idle', 'F5 check complete — 1 degraded pool');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 5200);
-}
-
-// ── Monitor-Eye: Alerts and SNMP check ───────────────────────────────────────
-function simulateAlertCheck(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = 'Alert & Monitor Check';
-  updateAgentStatus(agentId, 'active', 'Checking alerts');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  const steps = [
-    { delay: 300,  msg: '👁️ Querying monitoring systems...' },
-    { delay: 1000, msg: '📡 Splunk — last 60 min:\n──────────────────────────────────\nERROR events:  23\nWARN events:  147\nINFO events:  8,431\n\nTop sources:\n  firewall-01:    8 errors\n  router-core:    6 errors\n  server-db01:    5 errors' },
-    { delay: 2300, msg: '📡 SNMP Traps (last 1h):\n──────────────────────────────────\n09:15 linkDown    router-edge-01 Gi0/0/0/2\n09:17 linkUp      router-edge-01 Gi0/0/0/2  ← recovered\n09:31 cpuThreshold switch-core-02 (82%)\n09:41 bgpEstablished peer 10.0.0.3' },
-    { delay: 3500, msg: '📡 Active threshold alerts:\n──────────────────────────────────\n🔴 switch-core-02  CPU 82%  (threshold: 80%)\n🟡 server-db01      Disk 78% (threshold: 75%)\n🟢 All other devices — normal' },
-    { delay: 4600, msg: '✅ Monitoring Summary\n──────────────────────────────────\n🔴 Critical:  1  (switch-core-02 CPU spike)\n🟡 Warning:   1  (server-db01 disk)\n🟢 OK:        All other devices\n\n📋 Recommended actions:\n  → Investigate switch-core-02 CPU (possible routing loop)\n  → Schedule disk cleanup on server-db01\n  → router-edge-01 link flap at 09:15 was transient — resolved' },
-  ];
-
-  steps.forEach(s => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: s.msg, timestamp: new Date().toISOString()
-      });
-    }, s.delay);
-  });
-
-  setTimeout(() => {
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Alert check — 1 critical, 1 warning\n`);
-    updateAgentStatus(agentId, 'idle', 'Alert check complete — 1 critical');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 5200);
-}
-
-// ── Config-Keeper: Compliance and drift check ─────────────────────────────────
-function simulateConfigCheck(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = 'Config Compliance Check';
-  updateAgentStatus(agentId, 'active', 'Running config compliance check');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  const steps = [
-    { delay: 350,  msg: '📋 Loading configuration baselines...' },
-    { delay: 1100, msg: '📡 Comparing running vs backup (24h delta):\n──────────────────────────────────\nrouter-core-01  ⚠️   2 changes\nswitch-core-01  ✅   0 changes\nfirewall-01     ⚠️   5 changes\nswitch-dist-01  ✅   0 changes\nrouter-edge-01  ⚠️   1 change' },
-    { delay: 2400, msg: '⚠️  Drift details:\n──────────────────────────────────\nrouter-core-01:\n  + ip route 0.0.0.0/0 10.0.0.254  (added)\n  - ip route 10.10.0.0/16 10.0.0.1  (removed)\n\nfirewall-01:\n  + policy 143 ALLOW srv-new→internet\n  + address-object srv-new 10.10.5.20\n  ~ policy 22 description changed\n  + schedule recurring weekend-maint\n  - service custom-8181' },
-    { delay: 3700, msg: '📡 Compliance audit:\n──────────────────────────────────\n✅ NTP servers:         Compliant\n✅ SNMPv3 only:         Compliant\n✅ Telnet disabled:     Compliant\n⚠️  SSH timeout:         Non-compliant (router-core-01: 60min, policy: 10min)\n⚠️  Password complexity: Non-compliant (2 devices)\n✅ Logging to SIEM:     Compliant' },
-    { delay: 5000, msg: '✅ Config Report\n──────────────────────────────────\n📦 Backups:     All 5 devices backed up ✅\n⚠️  Drift:       8 changes across 3 devices\n🔴 Compliance:  2 failures (SSH timeout, password policy)\n\n📋 Firewall policy 143 needs CAB approval — new rule added without ticket.\n   SSH timeout remediation required on router-core-01.' },
-  ];
-
-  steps.forEach(s => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: s.msg, timestamp: new Date().toISOString()
-      });
-    }, s.delay);
-  });
-
-  setTimeout(() => {
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Config check — drift on 3 devices, 2 compliance failures\n`);
-    updateAgentStatus(agentId, 'idle', 'Config check complete — 2 compliance failures');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 5600);
-}
-
-// ── Incident-Handler: Active incident check ───────────────────────────────────
-function simulateIncidentCheck(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = 'Incident Status Check';
-  updateAgentStatus(agentId, 'active', 'Checking active incidents');
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  setTimeout(() => {
-    broadcast('chat_message', {
-      type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-      text: '🚨 Checking active incidents...\n──────────────────────────────────\nActive incidents:    0\nResolved (24h):      2\n\n📋 Recent:\n[RESOLVED] INC-2024-089 — BGP peer flap AS65004  (resolved 2h ago)\n[RESOLVED] INC-2024-088 — SSL cert expiry warning server-api-02  (resolved 6h ago)\n\n✅ No active incidents. Squad is operating normally.',
-      timestamp: new Date().toISOString()
-    });
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Incident check complete — 0 active\n`);
-    updateAgentStatus(agentId, 'idle', 'Incident check complete — 0 active');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 1500);
-}
-
-// ── Main agent action dispatcher — NLU-driven ─────────────────────────────────
+// ── Main agent action dispatcher — live sources, no simulation ───────────────
+// Every network answer below comes from a real Cisco DevNet always-on sandbox
+// via sources/live-agents.js. Agents without a backend say "not connected".
 function simulateAgentAction(agentId, command) {
   const agent = agents[agentId];
   if (!agent) return;
 
   updateAgentStatus(agentId, 'active', `Processing: ${command}`);
 
-  if (agentId === 'jarvis') {
-    simulateJarvisAction(agentId, command);
-    return;
-  }
+  // Jarvis keeps its squad-coordination intents (standup, roll call, triage);
+  // anything network-shaped falls through to the live sources.
+  if (agentId === 'jarvis') return simulateJarvisAction(agentId, command);
 
   const intent = detectAgentIntent(agentId, command);
   appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Intent: ${intent} — "${command.slice(0, 60)}"\n`);
 
   switch (intent) {
-    case 'bgp_status':        return simulateBGPStatus(agentId);
-    case 'security_scan':     return simulateSecurityScan(agentId, command);
-    case 'firewall_check':    return simulateFirewallCheck(agentId, command);
-    case 'lb_check':          return simulateLBCheck(agentId, command);
-    case 'alert_check':       return simulateAlertCheck(agentId, command);
-    case 'config_check':      return simulateConfigCheck(agentId, command);
-    case 'incident_check':    return simulateIncidentCheck(agentId, command);
-    case 'configure_device':  return simulateNetOpsConfig(agentId, command);
-    case 'precheck':          return simulatePrecheck(agentId, command);
-    case 'ping':              return simulatePing(agentId);
-    case 'help':              return showAgentHelp(agentId);
-    case 'domain_status':     return simulateAgentDomainStatus(agentId, command);
-    default:                  return simulateAgentIntelligentResponse(agentId, command);
+    // Read-only is enforced before anything reaches a device.
+    case 'configure_device': return live.refuseWrite(agentId, command);
+    case 'ping':             return simulatePing(agentId);
+    case 'help':             return showAgentHelp(agentId);
+    default:                 return live.handle(agentId, command);
   }
 }
 
-// Simulate pre-check operation
-function simulatePrecheck(agentId, command) {
-  const agent = agents[agentId];
-  const taskTitle = `Pre-check: ${command}`;
 
-  // Create task in IN PROGRESS
-  addTaskToBoard('inProgress', {
-    title: taskTitle,
-    agent: agent.name,
-    completed: false
-  });
-
-  const steps = [
-    { delay: 500,  msg: '🔄 Initializing pre-check sequence...', action: 'Initializing pre-check' },
-    { delay: 1200, msg: '🔌 SSH connecting to sandbox-iosxr-1.cisco.com\n$ ssh admin@sandbox-iosxr-1.cisco.com\n  Username: admin\n  Password: C1sco12345\n  Port: 22', action: 'SSH connecting' },
-    { delay: 2500, msg: '✅ SSH connection established\n  Banner: Cisco IOS XR Software, Version 7.3.2\n  Copyright (c) 2013-2023 by Cisco Systems, Inc.', action: 'Connected to device' },
-    { delay: 3200, msg: '📡 Running: show version\n─────────────────────────────\nCisco IOS XR Software, Version 7.3.2\nCopyright (c) 2013-2023 by Cisco Systems\nUptime: 48 days, 3 hours, 17 minutes\nProcessor: RP/0/RSP0/CPU0\nSystem RAM: 16G total, 8.9G available', action: 'show version' },
-    { delay: 4000, msg: '📡 Running: show ip interface brief\n─────────────────────────────\nInterface            IP-Address   Status   Protocol\nGig0/0/0/0           192.168.1.1  Up       Up\nGig0/0/0/1           10.0.0.1     Up       Up\nLoopback0            1.1.1.1      Up       Up', action: 'show ip interface brief' },
-    { delay: 4800, msg: '📡 Running: show processes cpu | head 5\n─────────────────────────────\nCPU utilization for five seconds: 12%/3%\nPID  Runtime(ms)  Invoked  uSecs  5Sec  1Min  5Min  Process\n  1       139764   210263    665   0%    0%    0%  init\n  2         7808    23415    333   0%    0%    0%  kthreadd', action: 'show processes cpu' },
-    { delay: 5600, msg: '📡 Running: show memory summary\n─────────────────────────────\nPhysical Memory:  16384M total\nApplication Memory: 8192M total (45% used)\nPage/cache Memory: 4096M\nFree Memory: 4096M', action: 'show memory summary' },
-    { delay: 6400, msg: '📡 Running: show bgp summary\n─────────────────────────────\nBGP router identifier 1.1.1.1, local AS 65001\nNeighbor        AS    Up/Down   State     PfxRcd\n10.0.0.1        65002  3d01h    Established  150\n10.0.0.2        65003  5d12h    Established  200\n10.0.0.3        65004  2d07h    Established  175', action: 'Checking BGP status' },
-    { delay: 7200, msg: '📡 Running: show route summary\n─────────────────────────────\nRoute Source       Routes  Backup  Deleted  Memory\nconnected          3       0       0        3120\nstatic             1       0       0        1040\nbgp 65001          525     0       0        546000\nOSPF 1             47      0       0        48880\nTotal              576     0       0        599040', action: 'show route summary' },
-    { delay: 8000, msg: '📡 Running: show logging last 10\n─────────────────────────────\nLog Buffer (2097152 bytes):\n%OSPF-5-ADJCHG: Process 1, Nbr 10.0.0.5 on Gi0/0/0/0 from LOADING to FULL\n%BGP-5-ADJCHANGE: neighbor 10.0.0.1 Up\n%LINK-3-UPDOWN: Interface GigabitEthernet0/0/0/0, changed state to up', action: 'show logging' },
-    { delay: 8800, msg: '📝 All checks complete — generating report...', action: 'Writing report' },
-  ];
-
-  steps.forEach(step => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming',
-        agent: agentId,
-        agentName: agent.name,
-        agentIcon: agent.icon,
-        text: step.msg,
-        timestamp: new Date().toISOString()
-      });
-      appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ${step.action}\n`);
-      updateAgentStatus(agentId, 'active', step.action);
-    }, step.delay);
-  });
-
-  // Final completion
-  setTimeout(() => {
-    const reportName = `precheck-${Date.now()}.md`;
-    const reportsDir = path.join(SQUAD_ROOT, 'agents', agentId, 'reports');
-    if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
-    const reportPath = path.join(reportsDir, reportName);
-    const reportContent = `# Pre-Check Report
-**Device:** sandbox-iosxr-1.cisco.com
-**Generated:** ${new Date().toISOString()}
-**Agent:** ${agent.name}
-**Command:** ${command}
-
-## Summary
-- Status: ✅ PASSED
-- Connectivity: OK
-- SSH: Connected
-- CPU: 12%
-- Memory: 45%
-- Uptime: 48 days
-
-## BGP Status
-| Neighbor | State | Prefixes |
-|----------|-------|----------|
-| 10.0.0.1 | Established | 150 |
-| 10.0.0.2 | Established | 200 |
-| 10.0.0.3 | Established | 175 |
-
-## Interfaces
-- GigabitEthernet0/0/0/0: UP
-- GigabitEthernet0/0/0/1: UP
-- Loopback0: UP
-
-## Conclusion
-All pre-checks passed. Device is healthy and ready for changes.
-`;
-
-    fs.writeFileSync(reportPath, reportContent);
-
-    broadcast('chat_message', {
-      type: 'incoming',
-      agent: agentId,
-      agentName: agent.name,
-      agentIcon: agent.icon,
-      text: `✅ Pre-check complete!\n📁 Report saved: ${reportName}`,
-      timestamp: new Date().toISOString()
-    });
-
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ✅ Pre-check complete. Report: ${reportName}\n`);
-    updateAgentStatus(agentId, 'idle', `Completed pre-check. Report: ${reportName}`);
-
-    // Move task to DONE
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 10000);
-}
-
-// ============ NETOPS CONFIGURATION ENGINE ============
-
-// Parse a configuration request to extract parameters
-function parseNetOpsConfigRequest(command) {
-  const t = command.toLowerCase();
-
-  // Interface detection
-  const loopbackMatch = t.match(/\blo(?:opback)?\s*(\d+)\b/);
-  const giMatch = t.match(/\b(?:gi|gig|gigabit(?:ethernet)?)\s*([\d\/]+)\b/);
-  const ethMatch = t.match(/\beth(?:ernet)?\s*([\d\/]+)\b/);
-
-  // IP address
-  const ipMatch = command.match(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/);
-  const prefixMatch = command.match(/\/(\d{1,2})\b/);
-
-  // VLAN
-  const vlanMatch = t.match(/\bvlan\s*(\d+)\b/);
-
-  // Static route destination/next-hop
-  const routeMatches = command.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/g);
-
-  // Description
-  const descMatch = command.match(/description[:\s]+"?([^"]+)"?/i);
-
-  // Determine config type
-  let configType = 'general';
-  let ifaceName = null;
-  let ifaceShort = null;
-
-  if (loopbackMatch) {
-    configType = 'interface';
-    ifaceName = `Loopback${loopbackMatch[1]}`;
-    ifaceShort = `Lo${loopbackMatch[1]}`;
-  } else if (giMatch) {
-    configType = 'interface';
-    ifaceName = `GigabitEthernet${giMatch[1]}`;
-    ifaceShort = `Gi${giMatch[1]}`;
-  } else if (ethMatch) {
-    configType = 'interface';
-    ifaceName = `Ethernet${ethMatch[1]}`;
-    ifaceShort = `Et${ethMatch[1]}`;
-  } else if (vlanMatch) {
-    configType = 'vlan';
-  } else if (/\b(static[\s-]?route|add[\s-]?route|ip[\s-]?route)\b/.test(t)) {
-    configType = 'route';
-  } else if (/\bntp\b/.test(t)) {
-    configType = 'ntp';
-  } else if (/\bsnmp\b/.test(t)) {
-    configType = 'snmp';
-  } else if (/\b(ospf)\b/.test(t)) {
-    configType = 'ospf';
-  } else if (/\b(no[\s-]?shut|bring[\s-]?up|enable[\s-]interface)\b/.test(t)) {
-    configType = 'no_shutdown';
-  } else if (/\b(shut|shutdown|disable[\s-]interface)\b/.test(t)) {
-    configType = 'shutdown';
-  } else if (/\bdescription\b/.test(t)) {
-    configType = 'description';
-  }
-
-  return {
-    configType,
-    ifaceName,
-    ifaceShort,
-    ip: ipMatch ? ipMatch[1] : null,
-    prefix: prefixMatch ? prefixMatch[1] : '32',
-    mask: prefixMatch ? cidrToMask(parseInt(prefixMatch[1])) : '255.255.255.255',
-    vlan: vlanMatch ? vlanMatch[1] : null,
-    routeIPs: routeMatches || [],
-    description: descMatch ? descMatch[1].trim() : `Configured by NetOps - ${new Date().toISOString().slice(0,10)}`
-  };
-}
-
-function cidrToMask(prefix) {
-  const masks = {
-    32: '255.255.255.255', 30: '255.255.255.252', 29: '255.255.255.248',
-    28: '255.255.255.240', 27: '255.255.255.224', 26: '255.255.255.192',
-    25: '255.255.255.128', 24: '255.255.255.0',   23: '255.255.254.0',
-    22: '255.255.252.0',   16: '255.255.0.0',      8: '255.0.0.0'
-  };
-  return masks[prefix] || '255.255.255.0';
-}
-
-// Build config steps based on parsed request
-function buildNetOpsConfigSteps(parsed, command, agentName) {
-  const { configType, ifaceName, ifaceShort, ip, prefix, mask, vlan, description } = parsed;
-  const ts = () => new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-
-  switch (configType) {
-
-    case 'interface': {
-      const iface = ifaceName || 'Loopback0';
-      const short = ifaceShort || 'Lo0';
-      const addr = ip || '10.10.10.1';
-      const isLoopback = iface.startsWith('Loopback');
-      return [
-        { delay: 400,  action: 'Analyzing request',
-          msg: `🔍 Analyzing configuration request...\n• Type: Interface configuration\n• Interface: ${iface}\n• IP Address: ${addr}/${prefix}\n• Action: Create & bring up` },
-        { delay: 1300, action: 'Pre-check: verifying interface',
-          msg: `📋 Pre-check: Verifying ${iface} on sandbox-iosxr-1.cisco.com\n─────────────────────────────────\n$ show interfaces ${iface} brief\nInterface ${iface} — not found ✅ Safe to proceed` },
-        { delay: 2400, action: 'SSH connecting',
-          msg: `🔌 Connecting to device...\n$ ssh admin@sandbox-iosxr-1.cisco.com\nWarning: Permanently added 'sandbox-iosxr-1.cisco.com' to known hosts.\n✅ Connected — Cisco IOS XR 7.3.2` },
-        { delay: 3400, action: 'Entering config mode',
-          msg: `⚙️  Entering configuration mode...\nRP/0/RSP0/CPU0:sandbox-iosxr-1#configure terminal\nEntering configuration mode terminal\nUncommitted changes found, use 'show commit changes diff'` },
-        { delay: 4600, action: `Configuring ${iface}`,
-          msg: `📝 Applying interface configuration...\n─────────────────────────────────\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#interface ${iface}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-if)#ipv4 address ${addr} ${mask}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-if)#no shutdown\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-if)#description ${description}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-if)#exit` },
-        { delay: 6000, action: 'Committing changes',
-          msg: `💾 Committing configuration...\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#commit\n${ts()}\n% Commit succeeded.\nConfiguration committed by ${agentName}` },
-        { delay: 7400, action: 'Verifying interface UP',
-          msg: `✅ Verification: ${iface} status\n─────────────────────────────────\n$ show interfaces ${iface}\n${iface} is up, line protocol is up\n  Description: ${description}\n  Internet Address is ${addr}/${prefix}\n  MTU 1500 bytes, BW 8000000 Kbit\n  Last link flapped 00:00:02 ago` },
-        { delay: 8800, action: 'Connectivity test',
-          msg: `🏓 Connectivity test: ping ${addr}\n─────────────────────────────────\n$ ping ${addr} source Loopback0 count 5\nSending 5, 100-byte ICMP Echos to ${addr}\n!!!!!\nSuccess rate is 100 percent (5/5), round-trip min/avg/max = 1/1/2 ms` },
-      ];
-    }
-
-    case 'vlan': {
-      const vid = vlan || '100';
-      return [
-        { delay: 400,  action: 'Analyzing VLAN request',
-          msg: `🔍 Analyzing VLAN configuration request...\n• VLAN ID: ${vid}\n• Action: Create VLAN` },
-        { delay: 1200, action: 'Pre-check: VLAN database',
-          msg: `📋 Pre-check: Checking VLAN database\n$ show vlan brief | grep ${vid}\nVLAN ${vid} — not found ✅ Safe to create` },
-        { delay: 2400, action: 'SSH connecting',
-          msg: `🔌 Connected to sandbox-iosxr-1.cisco.com ✅` },
-        { delay: 3400, action: `Creating VLAN ${vid}`,
-          msg: `📝 Creating VLAN ${vid}...\n─────────────────────────────────\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#vlan ${vid}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-vlan)#name VLAN_${vid}_NetOps\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-vlan)#state active\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-vlan)#exit` },
-        { delay: 4800, action: 'Committing VLAN config',
-          msg: `💾 Committing...\n${ts()}\n% Commit succeeded.` },
-        { delay: 6000, action: 'Verifying VLAN',
-          msg: `✅ Verification:\n$ show vlan id ${vid}\nVLAN  Name                Status\n${vid}    VLAN_${vid}_NetOps    active` },
-      ];
-    }
-
-    case 'route': {
-      const dest = parsed.routeIPs[0] || '0.0.0.0';
-      const nextHop = parsed.routeIPs[1] || '192.168.1.254';
-      return [
-        { delay: 400,  action: 'Analyzing route request',
-          msg: `🔍 Analyzing static route request...\n• Destination: ${dest}/${prefix}\n• Next-Hop: ${nextHop}` },
-        { delay: 1400, action: 'Pre-check: routing table',
-          msg: `📋 Pre-check: Checking routing table\n$ show route ${dest}\nRoute not found ✅ Safe to add` },
-        { delay: 2600, action: 'SSH connecting',
-          msg: `🔌 Connected to sandbox-iosxr-1.cisco.com ✅` },
-        { delay: 3600, action: `Adding static route`,
-          msg: `📝 Adding static route...\n─────────────────────────────────\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#router static\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-static)#address-family ipv4 unicast\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-static-afi)#${dest}/${prefix} ${nextHop}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-static-afi)#exit` },
-        { delay: 5000, action: 'Committing route',
-          msg: `💾 Committing...\n${ts()}\n% Commit succeeded.` },
-        { delay: 6200, action: 'Verifying route',
-          msg: `✅ Route in table:\n$ show route ${dest}\nS    ${dest}/${prefix} [1/0] via ${nextHop}, GigabitEthernet0/0/0/0` },
-      ];
-    }
-
-    case 'ntp': {
-      const ntpServer = ip || '216.239.35.0';
-      return [
-        { delay: 400,  action: 'Analyzing NTP request',
-          msg: `🔍 Analyzing NTP configuration...\n• NTP Server: ${ntpServer}` },
-        { delay: 1400, action: 'Pre-check: NTP status',
-          msg: `📋 Pre-check: Current NTP status\n$ show ntp status\nClock is unsynchronized — configuring NTP server` },
-        { delay: 2600, action: 'Configuring NTP',
-          msg: `📝 Configuring NTP server...\n─────────────────────────────────\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#ntp server ${ntpServer} prefer\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#ntp update-calendar` },
-        { delay: 4000, action: 'Committing NTP config',
-          msg: `💾 Committing...\n${ts()}\n% Commit succeeded.` },
-        { delay: 5400, action: 'Verifying NTP sync',
-          msg: `✅ NTP Verification:\n$ show ntp associations\n  address         ref clock   st   when  poll reach  delay  offset\n*~${ntpServer}   .GOOG.      1     12    64   377  1.483  +0.231\n* sys.peer, # selected, + candidate, - outlier` },
-      ];
-    }
-
-    case 'shutdown': {
-      const iface = ifaceName || 'GigabitEthernet0/0/0/1';
-      return [
-        { delay: 400,  action: 'Analyzing shutdown request',
-          msg: `🔍 Shutdown request: ${iface}` },
-        { delay: 1400, action: 'Pre-check: interface state',
-          msg: `📋 Pre-check: ${iface} is currently UP — proceeding with shutdown` },
-        { delay: 2600, action: `Shutting down ${iface}`,
-          msg: `📝 Applying shutdown...\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#interface ${iface}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-if)#shutdown` },
-        { delay: 3800, action: 'Committing shutdown',
-          msg: `💾 Committing...\n% Commit succeeded.` },
-        { delay: 5000, action: 'Verifying interface down',
-          msg: `✅ Verification:\n$ show interfaces ${iface} brief\n${iface} is admin-down, line protocol is down` },
-      ];
-    }
-
-    case 'no_shutdown': {
-      const iface = ifaceName || 'GigabitEthernet0/0/0/1';
-      return [
-        { delay: 400,  action: 'Analyzing no-shutdown request',
-          msg: `🔍 No-shutdown request: ${iface}` },
-        { delay: 1400, action: 'Pre-check: interface state',
-          msg: `📋 Pre-check: ${iface} is currently admin-down — proceeding to bring up` },
-        { delay: 2600, action: `Bringing up ${iface}`,
-          msg: `📝 Applying no shutdown...\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#interface ${iface}\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config-if)#no shutdown` },
-        { delay: 3800, action: 'Committing interface up',
-          msg: `💾 Committing...\n% Commit succeeded.` },
-        { delay: 5200, action: 'Verifying interface UP',
-          msg: `✅ Verification:\n$ show interfaces ${iface} brief\n${iface} is up, line protocol is up\nLast link flapped 00:00:01 ago` },
-      ];
-    }
-
-    default: {
-      // Generic config fallback
-      return [
-        { delay: 400,  action: 'Analyzing configuration request',
-          msg: `🔍 Analyzing request: "${command.slice(0, 60)}"\n• Preparing configuration sequence...` },
-        { delay: 1500, action: 'Running pre-check',
-          msg: `📋 Pre-check: Verifying current device state...\n$ show running-config | relevant\n✅ Device reachable and ready for changes` },
-        { delay: 2800, action: 'SSH connecting',
-          msg: `🔌 Connected to sandbox-iosxr-1.cisco.com ✅\nCisco IOS XR Software, Version 7.3.2` },
-        { delay: 4000, action: 'Applying configuration',
-          msg: `📝 Applying configuration...\nRP/0/RSP0/CPU0:sandbox-iosxr-1(config)#${command.slice(0, 60)}\nConfiguration accepted.` },
-        { delay: 5500, action: 'Committing changes',
-          msg: `💾 Committing...\n${ts()}\n% Commit succeeded.` },
-        { delay: 7000, action: 'Verifying changes',
-          msg: `✅ Change verification passed — configuration is active.` },
-      ];
-    }
-  }
-}
-
-// Main NetOps configuration dispatcher
-function simulateNetOpsConfig(agentId, command) {
-  const agent = agents[agentId];
-  const parsed = parseNetOpsConfigRequest(command);
-  const taskTitle = `Configure: ${command.slice(0, 48)}`;
-
-  addTaskToBoard('inProgress', {
-    title: taskTitle,
-    agent: agent.name,
-    priority: 'HIGH',
-    completed: false,
-    createdAt: new Date().toISOString()
-  });
-
-  updateAgentStatus(agentId, 'active', `Configuring: ${command.slice(0, 40)}`);
-  appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Config request [${parsed.configType}]: ${command}\n`);
-
-  broadcast('chat_message', {
-    type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-    text: `🔧 **NetOps Configuration Engine**\nProcessing: "${command.slice(0, 60)}"\nType detected: ${parsed.configType.replace('_', ' ').toUpperCase()}`,
-    timestamp: new Date().toISOString()
-  });
-
-  const steps = buildNetOpsConfigSteps(parsed, command, agent.name);
-
-  steps.forEach(step => {
-    setTimeout(() => {
-      broadcast('chat_message', {
-        type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-        text: step.msg, timestamp: new Date().toISOString()
-      });
-      if (step.action) {
-        appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ${step.action}\n`);
-        updateAgentStatus(agentId, 'active', step.action);
-      }
-    }, step.delay);
-  });
-
-  // Final completion
-  const lastDelay = steps[steps.length - 1].delay + 1800;
-  setTimeout(() => {
-    const reportName = `config-change-${Date.now()}.md`;
-    const reportsDir = path.join(SQUAD_ROOT, 'agents', agentId, 'reports');
-    if (!fs.existsSync(reportsDir)) fs.mkdirSync(reportsDir, { recursive: true });
-    const reportPath = path.join(reportsDir, reportName);
-    const reportContent = [
-      `# Configuration Change Report`,
-      `**Device:** sandbox-iosxr-1.cisco.com`,
-      `**Agent:** ${agent.name}`,
-      `**Type:** ${parsed.configType}`,
-      `**Timestamp:** ${new Date().toISOString()}`,
-      `**Command:** ${command}`,
-      ``,
-      `## Parameters`,
-      parsed.ifaceName  ? `- Interface: ${parsed.ifaceName}` : '',
-      parsed.ip         ? `- IP Address: ${parsed.ip}/${parsed.prefix}` : '',
-      parsed.vlan       ? `- VLAN: ${parsed.vlan}` : '',
-      ``,
-      `## Result`,
-      `- Status: ✅ SUCCESS`,
-      `- Committed: Yes`,
-      `- Verification: Passed`,
-    ].filter(Boolean).join('\n');
-    fs.writeFileSync(reportPath, reportContent);
-
-    broadcast('chat_message', {
-      type: 'incoming', agent: agentId, agentName: agent.name, agentIcon: agent.icon,
-      text: `✅ **Configuration Complete!**\n📋 Change log: ${reportName}\n🔒 Committed to device — rollback available if needed`,
-      timestamp: new Date().toISOString()
-    });
-
-    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ✅ Config complete [${parsed.configType}]. Report: ${reportName}\n`);
-    updateAgentStatus(agentId, 'idle', `Config complete: ${reportName}`);
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, lastDelay);
-}
 
 // Simulate status check
 function simulateStatusCheck(agentId) {
@@ -1377,6 +762,13 @@ function simulateJarvisGeneralResponse(agentId, command) {
 
 // Main Jarvis entry point — intent-driven, no fixed commands
 function simulateJarvisAction(agentId, command) {
+  // A question about the NETWORK (not about the squad) is answered from the
+  // live sandboxes, never from the squad roster.
+  if (/\b(network|device|devices|inventory|fabric|switch(es)?|router|wan|sd-?wan|aci|health|reachab|overview)\b/i.test(command)) {
+    appendToActivityLog(`[${new Date().toISOString()}] [Jarvis] Intent: live_network — "${command.slice(0, 60)}"\n`);
+    return live.handle(agentId, command);
+  }
+
   const intent = detectJarvisIntent(command);
   const subject = extractJarvisSubject(command);
 
@@ -2400,6 +1792,26 @@ app.get('/api/files', (req, res) => {
 
 app.get('/api/activity', (req, res) => {
   res.json(getRecentActivity());
+});
+
+// Which live sources are wired up right now, and which agents they feed.
+// An honest "not connected" is a first-class answer here.
+app.get('/api/sources', async (req, res) => {
+  const check = async (mod) => {
+    if (!mod.configured()) return { host: mod.host, status: 'not connected', detail: 'credentials not set' };
+    try { await mod.probe(); return { host: mod.host, status: 'live' }; }
+    catch (e) { return { host: mod.host, status: 'unreachable', detail: e.message }; }
+  };
+
+  res.json({
+    sources: {
+      'catalyst-center': { label: catalyst.label, ...(await check(catalyst)), agents: ['netops', 'monitor-eye', 'incident-handler', 'doc-writer', 'config-keeper', 'jarvis'] },
+      'aci': { label: aci.label, ...(await check(aci)), agents: ['router-expert', 'incident-handler', 'doc-writer', 'jarvis'] },
+      'sdwan': { label: sdwan.label, ...(await check(sdwan)), agents: ['router-expert', 'monitor-eye', 'doc-writer', 'jarvis'] },
+    },
+    notConnected: live.NO_BACKEND,
+    readOnly: true,
+  });
 });
 
 app.post('/api/command', (req, res) => {
