@@ -588,7 +588,7 @@ function simulatePing(agentId) {
       agent: agentId,
       agentName: agent.name,
       agentIcon: agent.icon,
-      text: `🏓 Pong! Agent is responsive.\nLatency: 2ms\nUptime: ${Math.floor(process.uptime())}s`,
+      text: `🏓 Pong! Agent is responsive.\nDashboard uptime: ${Math.floor(process.uptime())}s\n\n(This is the agent answering, not a device. For a real device reachability test ask Config-Keeper to "ping <address>".)`,
       timestamp: new Date().toISOString()
     });
     updateAgentStatus(agentId, 'idle', 'Ping responded');
@@ -596,9 +596,25 @@ function simulatePing(agentId) {
   }, 500);
 }
 
-// Show agent help
+// Show agent help.
+// The help text is built from what this agent can ACTUALLY do right now: the
+// old version printed NetOps' capability list for every agent and advertised
+// configuration commands that the read-only guardrail always refuses.
 function showAgentHelp(agentId) {
   const agent = agents[agentId];
+  const missing = live.NO_BACKEND[agentId];
+
+  const body = missing
+    ? `🔌 **Not connected.**\nI have no ${missing} wired up, so I cannot report anything real.\n` +
+      `I will not invent a report. Add the credentials to .env.local and I will answer for real.`
+    : live.hasLiveBackend(agentId)
+      ? `🔍 **Reads I can do (live, read-only)**\n` +
+        `• Ask me in plain English — I answer from a real Cisco DevNet sandbox.\n` +
+        `• show / ping / traceroute / dir / more — the only verbs allowed through to a device.\n\n` +
+        `🚫 **What I will refuse**\n` +
+        `Anything that changes a device: configure, write, reload, erase, shut/no shut, copy, delete.\n` +
+        `Read-only is enforced in code (sources/guardrails.js), not by convention.`
+      : `I have no live data source mapped, so I will report "not connected" rather than guess.`;
 
   setTimeout(() => {
     broadcast('chat_message', {
@@ -606,7 +622,7 @@ function showAgentHelp(agentId) {
       agent: agentId,
       agentName: agent.name,
       agentIcon: agent.icon,
-      text: `📚 **NetOps — Capabilities**\n\n🔧 **Configuration (new)**\n• configure interface lo10 with 10.0.0.1 — Create loopback/GigE interface\n• add vlan 100 — Create VLAN\n• add static route 10.0.0.0/24 via 192.168.1.1 — Add route\n• configure ntp server 216.239.35.0 — Set NTP\n• shut interface gi0/0/0/1 — Shutdown interface\n• no shut interface gi0/0/0/1 — Bring up interface\n\n📋 **Health Checks**\n• run prechecks — Full device health check\n• status — Agent status\n• ping — Test connectivity\n• help — This help`,
+      text: `📚 **${agent.name} — Capabilities**\n\n${body}\n\n📋 **Always available**\n• status — Agent status\n• ping — Agent responsiveness\n• help — This help`,
       timestamp: new Date().toISOString()
     });
     updateAgentStatus(agentId, 'idle', 'Help displayed');
