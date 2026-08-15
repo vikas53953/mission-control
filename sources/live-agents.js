@@ -372,6 +372,212 @@ function refuseWrite(agentId, command) {
   ctx.updateAgentStatus(agentId, 'idle', 'Refused a write — read-only mode');
 }
 
+// ── Debate contributions — live reads only ──────────────────────────────────
+// A debate contribution is NOT an opinion generator. Each agent runs the same
+// read-only queries it would run for a direct question, and reports what those
+// queries actually returned. There is no stance picking, no canned argument and
+// no fallback text: an agent either has fresh numbers from its own source, or
+// it says it is not connected / the source is unreachable.
+//
+// Two stances only:
+//   'evidence' — live data came back; the text is what that data says.
+//   'no-data'  — no source wired up, or the source could not be reached.
+
+// Topics are free text, so keep quoting them short — but cut on a word break so
+// the quote reads like a topic and not a truncated string.
+function shortTopic(topic) {
+  const t = String(topic || '').trim();
+  if (t.length <= 90) return `"${t}"`;
+  const cut = t.slice(0, 90);
+  const space = cut.lastIndexOf(' ');
+  return `"${(space > 40 ? cut.slice(0, space) : cut)}…"`;
+}
+
+function noDataContribution(agentId, topic) {
+  const need = NO_BACKEND[agentId] || 'a live data source';
+  return {
+    stance: 'no-data',
+    text: `Not connected — I can't weigh in with data on ${shortTopic(topic)}.\n` +
+      `I have no ${need} wired up, so I have no readings to bring. ` +
+      `I won't argue a position I can't back with live data.`,
+  };
+}
+
+function unreachableContribution(source, topic, err) {
+  return {
+    stance: 'no-data',
+    text: `Source unreachable — I can't weigh in with data on ${shortTopic(topic)}.\n` +
+      `${source} did not answer: ${err.message}. No readings, so no position from me.`,
+  };
+}
+
+// Each builder does real reads and returns the text. Throwing is fine — the
+// caller turns it into an honest "source unreachable" line.
+const DEBATE_BUILDERS = {
+  'netops': {
+    source: () => `${catalyst.label} (${catalyst.host})`,
+    async build(topic) {
+      const devices = await catalyst.getDevices();
+      const health = await catalyst.getHealth().catch(() => null);
+      const down = devices.filter((d) => d.reachability !== 'Reachable');
+      return `Live from ${catalyst.label} (${catalyst.host}) just now: ` +
+        `${devices.length - down.length}/${devices.length} devices reachable` +
+        (devices.length ? ` — ${devices.map((d) => `${d.hostname} (${d.platform}, ${d.reachability})`).join('; ')}` : '') +
+        (health ? `. Network health score ${health.score} (good ${health.good} / bad ${health.bad})` : '') +
+        `.\nThat is the campus state anyone planning ${shortTopic(topic)} is working against. ` +
+        (down.length
+          ? `${down.map((d) => d.hostname).join(', ')} is not reachable right now, so that part I cannot vouch for.`
+          : `Nothing in that inventory is currently unreachable.`);
+    },
+  },
+
+  'monitor-eye': {
+    source: () => `${catalyst.label} (${catalyst.host})`,
+    async build(topic) {
+      const health = await catalyst.getHealth();
+      const issues = await catalyst.getIssues();
+      let wan = '';
+      try {
+        const alarms = await sdwan.getAlarmCount();
+        wan = ` SD-WAN (vManage ${sdwan.host}) reports ${alarms.active} active alarms.`;
+      } catch (e) {
+        wan = ` SD-WAN alarm feed unreachable (${e.message}) — I am not counting it.`;
+      }
+      return `Live monitoring read: health score ${health.score} across ${health.total} monitored devices ` +
+        `(good ${health.good} / bad ${health.bad}), ${issues.length} open issue(s)` +
+        (issues.length ? ` — ${issues.slice(0, 3).map((i) => `${i.priority} ${i.name}`).join('; ')}` : '') +
+        `.${wan}\nAgainst ${shortTopic(topic)}: that is the current baseline. ` +
+        `Any claim about trends beyond these numbers would be me guessing, so I am not making one.`;
+    },
+  },
+
+  'incident-handler': {
+    source: () => `${catalyst.label} / ${aci.label}`,
+    async build(topic) {
+      const issues = await catalyst.getIssues();
+      let faultLine;
+      try {
+        const faults = await aci.getFaults(['critical', 'major']);
+        const crit = faults.filter((f) => f.severity === 'critical').length;
+        faultLine = `ACI fabric (${aci.host}) has ${crit} critical and ${faults.length - crit} major fault(s)` +
+          (faults.length ? ` — e.g. F${faults[0].code} ${String(faults[0].description || '').slice(0, 80)}` : '');
+      } catch (e) {
+        faultLine = `ACI fault feed unreachable (${e.message}), so I have no fabric faults to add`;
+      }
+      return `Open incidents right now: Catalyst Center lists ${issues.length} issue(s)` +
+        (issues.length ? ` — ${issues.slice(0, 3).map((i) => `${i.priority} ${i.name} (${i.status}, seen ${i.occurrences}x)`).join('; ')}` : '') +
+        `. ${faultLine}.\nOn ${shortTopic(topic)}: that is what is already open. ` +
+        `I have no incident history beyond what these sources return, so I am not citing past outages.`;
+    },
+  },
+
+  'router-expert': {
+    source: () => `${aci.label} / ${sdwan.label}`,
+    async build(topic) {
+      if (ACI_WORDS.test(topic || '')) {
+        const nodes = await aci.getFabricNodes();
+        const health = await aci.getFabricHealth().catch(() => ({ score: null }));
+        const tenants = await aci.getTenants().catch(() => []);
+        return `Live from the APIC (${aci.host}): ${nodes.length} fabric node(s) — ` +
+          `${nodes.map((n) => `${n.name} ${n.role} ${n.state}`).join('; ')}` +
+          (health.score != null ? `. Fabric health ${health.score}` : '') +
+          (tenants.length ? `. ${tenants.length} tenant(s): ${tenants.map((t) => t.name).join(', ')}` : '') +
+          `.\nThat is the fabric ${shortTopic(topic)} would land on. I have not measured convergence or ` +
+          `traffic, so I am not making a claim about either.`;
+      }
+      const devices = await sdwan.getDevices();
+      const controllers = await sdwan.getControllers().catch(() => []);
+      const alarms = await sdwan.getAlarmCount().catch(() => ({ active: 'n/a' }));
+      return `Live from vManage (${sdwan.host}): ${devices.length} overlay device(s) — ` +
+        `${devices.map((d) => `${d.hostname} ${d.type} ${d.state}`).join('; ')}` +
+        (controllers.length ? `. Controllers: ${controllers.map((c) => c.hostname).join(', ')}` : '') +
+        `. Active alarms: ${alarms.active}.\nThat is the WAN state behind ${shortTopic(topic)}. ` +
+        `Routing-protocol behaviour beyond these device states is not something I can read, so I am not asserting it.`;
+    },
+  },
+
+  'config-keeper': {
+    source: () => `${catalyst.label} (${catalyst.host})`,
+    async build(topic) {
+      const devices = await catalyst.getDevices();
+      const versions = devices.map((d) => `${d.hostname}: ${d.software || 'version not reported'} (${d.reachability})`);
+      return `Live software/reachability read from ${catalyst.label} (${catalyst.host}):\n` +
+        (versions.join('\n') || 'no devices returned') +
+        `\nFor ${shortTopic(topic)}: those are the actual running versions on the boxes in scope. ` +
+        `I hold no backups or compliance baselines in this system, so I cannot claim rollback readiness.`;
+    },
+  },
+
+  'doc-writer': {
+    source: () => 'the connected sandboxes',
+    async build(topic) {
+      const parts = [];
+      let any = false;
+      try {
+        const devices = await catalyst.getDevices();
+        any = true;
+        parts.push(`Catalyst Center: ${devices.length} device(s) documented (${devices.map((d) => d.hostname).join(', ')})`);
+      } catch (e) { parts.push(`Catalyst Center unreachable — ${e.message}`); }
+      try {
+        const nodes = await aci.getFabricNodes();
+        any = true;
+        parts.push(`ACI: ${nodes.length} fabric node(s) (${nodes.map((n) => n.name).join(', ')})`);
+      } catch (e) { parts.push(`ACI unreachable — ${e.message}`); }
+      try {
+        const devices = await sdwan.getDevices();
+        any = true;
+        parts.push(`SD-WAN: ${devices.length} device(s) (${devices.map((d) => d.hostname).join(', ')})`);
+      } catch (e) { parts.push(`SD-WAN unreachable — ${e.message}`); }
+      if (!any) throw new Error('every source was unreachable');
+      return `What I can actually document for ${shortTopic(topic)} from live reads:\n${parts.join('\n')}\n` +
+        `Anything not on that list has no source behind it, so it would not go in a runbook.`;
+    },
+  },
+
+  'jarvis': {
+    source: () => 'all connected sources',
+    async build(topic) {
+      const lines = [];
+      let any = false;
+      try {
+        const devices = await catalyst.getDevices();
+        const health = await catalyst.getHealth();
+        any = true;
+        lines.push(`Campus: ${devices.filter((d) => d.reachability === 'Reachable').length}/${devices.length} reachable, health ${health.score}`);
+      } catch (e) { lines.push(`Campus (Catalyst Center) unreachable — ${e.message}`); }
+      try {
+        const nodes = await aci.getFabricNodes();
+        const faults = await aci.getFaults(['critical']);
+        any = true;
+        lines.push(`Data centre: ${nodes.length} ACI node(s), ${faults.length} critical fault(s)`);
+      } catch (e) { lines.push(`Data centre (ACI) unreachable — ${e.message}`); }
+      try {
+        const devices = await sdwan.getDevices();
+        const alarms = await sdwan.getAlarmCount();
+        any = true;
+        lines.push(`WAN: ${devices.length} SD-WAN device(s), ${alarms.active} active alarm(s)`);
+      } catch (e) { lines.push(`WAN (SD-WAN) unreachable — ${e.message}`); }
+      if (!any) throw new Error('every source was unreachable');
+      return `Moderating with live figures only. ${lines.join('. ')}.\n` +
+        `That is the whole evidence base for ${shortTopic(topic)}. ` +
+        `Sentinel, Firewall-Pro and LoadBal-Pro have no source, so their silence is not agreement — it is no data.`;
+    },
+  },
+};
+
+// Called once per participating agent when a debate runs.
+async function debateContribution(agentId, topic) {
+  if (NO_BACKEND[agentId]) return noDataContribution(agentId, topic);
+  const builder = DEBATE_BUILDERS[agentId];
+  if (!builder) return noDataContribution(agentId, topic);
+  try {
+    const text = await builder.build(topic);
+    return { stance: 'evidence', text };
+  } catch (err) {
+    return unreachableContribution(builder.source(), topic, err);
+  }
+}
+
 // Which agent answers from which live source.
 const HANDLERS = {
   'netops': netops,
@@ -393,4 +599,7 @@ function handle(agentId, command) {
   return fn(agentId, command);
 }
 
-module.exports = { init, handle, refuseWrite, notConnected, hasLiveBackend, NO_BACKEND };
+module.exports = {
+  init, handle, refuseWrite, notConnected, hasLiveBackend, NO_BACKEND,
+  debateContribution,
+};

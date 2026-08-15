@@ -21,7 +21,7 @@
 - App runs: `cd mission-control && node server.js` → http://localhost:3000 (HTTP 200, file-watcher active).
 - Stack: express ^4.18, ws ^8.16, chokidar ^3.5, cors. Single `server.js` (2663 lines) + single `public/index.html` (116 KB). No build step, no tests, no linter, not a git repo.
 - Agents (10): jarvis, netops, sentinel, firewall-pro, loadbal-pro, router-expert, monitor-eye, config-keeper, incident-handler, doc-writer. Each = CLAUDE.md persona + STATUS.json. Coordinate via network-squad/shared/*.md.
-- **Biggest finding: agent answers are largely SIMULATED** — canned BGP/F5/config reports with hardcoded `{delay, msg}` strings (server.js ~554-740). NetOps prechecks write real report files but SSH is simulated (hardcoded `sandbox-iosxr-1.cisco.com`, password `C1sco12345`).
+- **Biggest finding: agent answers are largely SIMULATED** — canned BGP/F5/config reports with hardcoded `{delay, msg}` strings (server.js ~554-740). NetOps prechecks write real report files but SSH is simulated (hardcoded `sandbox-iosxr-1.cisco.com`, password [redacted — Cisco public sandbox password]).
 - Hardcoded absolute path `SQUAD_ROOT = C:\Users\vikasmit\network-squad`. Regex-based intent routing. No auth / users / roles.
 
 ## Open questions (Stage 1)
@@ -139,7 +139,7 @@ sandbox). Each replies "not connected — needs sandbox credentials".
 - Any `configure_device` intent is refused before an adapter is touched.
 - The fabricated "NetOps configuration engine" (which pretended to commit config
   to a device) and every canned BGP/F5/FortiGate/Splunk report were **deleted**,
-  not left dormant — along with the hardcoded `C1sco12345` password that lived in
+  not left dormant — along with the hardcoded [redacted — Cisco public sandbox password] password that lived in
   the fake pre-check.
 
 ### Files

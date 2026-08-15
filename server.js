@@ -554,26 +554,6 @@ function simulateAgentAction(agentId, command) {
 
 
 
-// Simulate status check
-function simulateStatusCheck(agentId) {
-  const agent = agents[agentId];
-  const taskTitle = 'Status check';
-
-  addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
-
-  setTimeout(() => {
-    broadcast('chat_message', {
-      type: 'incoming',
-      agent: agentId,
-      agentName: agent.name,
-      agentIcon: agent.icon,
-      text: `📊 Agent Status:\n• Name: ${agent.name}\n• Status: ${agent.status}\n• Last Action: ${agent.lastAction}\n• Ready for commands: Yes`,
-      timestamp: new Date().toISOString()
-    });
-    updateAgentStatus(agentId, 'idle', 'Status reported');
-    moveTaskOnBoard(taskTitle, 'inProgress', 'done');
-  }, 1000);
-}
 
 // Simulate ping test
 function simulatePing(agentId) {
@@ -1330,66 +1310,43 @@ function startDebate(initiatorId, topic) {
     timestamp
   });
 
-  // Simulate agents responding with staggered delays
-  let delay = 2000;
+  // Each agent now goes and READS its own live source. No opinions are
+  // generated — an agent either reports what its source just returned, or says
+  // it is not connected. Runs one after another so the panel reads like a
+  // conversation, and every agent is handed back its previous status after it
+  // has spoken (a debate must not leave anyone stuck "active").
   const respondingAgents = uniqueParticipants.filter(id => id !== initiatorId);
+  runDebateContributions(thread, respondingAgents);
+}
 
-  respondingAgents.forEach((agentId, idx) => {
+// Walk the participants, one live read each, then let Jarvis summarise.
+async function runDebateContributions(thread, respondingAgents) {
+  const { id: debateId, topic } = thread;
+
+  for (const agentId of respondingAgents) {
     const agent = agents[agentId];
-    if (!agent) return;
+    if (!agent) continue;
+    if (thread.status !== 'open') break;
 
-    setTimeout(() => {
-      const response = generateDebateResponse(agentId, topic, idx, respondingAgents.length);
-      const msgTimestamp = new Date().toISOString();
+    const priorStatus = agent.status;
+    const priorAction = agent.lastAction;
+    updateAgentStatus(agentId, 'active', `Reading live data for debate: ${topic}`);
 
-      thread.messages.push({
-        id: thread.messages.length + 1,
-        agent: agentId,
-        agentName: agent.name,
-        agentIcon: agent.icon,
-        stance: response.stance,
-        text: response.text,
-        timestamp: msgTimestamp
-      });
-      thread.updated = msgTimestamp;
-
-      broadcast('debate_message', {
-        debateId,
-        message: thread.messages[thread.messages.length - 1]
-      });
-
-      broadcast('chat_message', {
-        type: 'incoming',
-        agent: agentId,
-        agentName: agent.name,
-        agentIcon: agent.icon,
-        text: `⚔️ [Debate] ${getStanceBadge(response.stance)} ${response.text}`,
-        timestamp: msgTimestamp
-      });
-
-      updateAgentStatus(agentId, 'active', `Debating: ${topic}`);
-    }, delay);
-
-    delay += 1500 + Math.random() * 1500;
-  });
-
-  // Jarvis summarizes after all agents respond
-  setTimeout(() => {
-    if (thread.status !== 'open') return;
-
-    const summary = generateDebateSummary(thread);
-    const summaryTimestamp = new Date().toISOString();
+    // debateContribution never throws — a failed read comes back as a
+    // "source unreachable" contribution, never as canned text.
+    const response = await live.debateContribution(agentId, topic);
+    const msgTimestamp = new Date().toISOString();
 
     thread.messages.push({
       id: thread.messages.length + 1,
-      agent: 'jarvis',
-      agentName: 'Jarvis',
-      agentIcon: '🎖️',
-      stance: 'summary',
-      text: summary,
-      timestamp: summaryTimestamp
+      agent: agentId,
+      agentName: agent.name,
+      agentIcon: agent.icon,
+      stance: response.stance,
+      text: response.text,
+      timestamp: msgTimestamp
     });
-    thread.updated = summaryTimestamp;
+    thread.updated = msgTimestamp;
 
     broadcast('debate_message', {
       debateId,
@@ -1398,88 +1355,65 @@ function startDebate(initiatorId, topic) {
 
     broadcast('chat_message', {
       type: 'incoming',
-      agent: 'jarvis',
-      agentName: 'Jarvis',
-      agentIcon: '🎖️',
-      text: `⚔️ [Debate Summary] ${summary}\n\nType "resolve" to close this debate, or continue discussing.`,
-      timestamp: summaryTimestamp
+      agent: agentId,
+      agentName: agent.name,
+      agentIcon: agent.icon,
+      text: `⚔️ [Debate] ${getStanceBadge(response.stance)} ${response.text}`,
+      timestamp: msgTimestamp
     });
-  }, delay + 2000);
-}
 
-// Generate debate response based on agent specialty
-function generateDebateResponse(agentId, topic, idx, totalAgents) {
-  const stances = ['agree', 'refute', 'alternative'];
-  // First agent more likely to agree, later ones more likely to challenge
-  const stanceWeights = idx === 0 ? [0.5, 0.2, 0.3] : idx === totalAgents - 1 ? [0.2, 0.5, 0.3] : [0.3, 0.3, 0.4];
-  const rand = Math.random();
-  let stance;
-  if (rand < stanceWeights[0]) stance = 'agree';
-  else if (rand < stanceWeights[0] + stanceWeights[1]) stance = 'refute';
-  else stance = 'alternative';
+    appendToActivityLog(`[${msgTimestamp}] [${agent.name}] Debate contribution (${response.stance}) on "${topic}"\n`);
 
-  const topicLower = topic.toLowerCase();
-  const responses = {
-    'sentinel': {
-      agree: `From a security standpoint, I support this. Our CVE monitoring shows this aligns with current threat mitigation best practices.`,
-      refute: `I have concerns — our latest threat intel suggests this could introduce new attack vectors. We need a thorough security assessment first.`,
-      alternative: `Instead, I'd recommend a phased approach with security gates at each stage. Let me run a vulnerability scan before we proceed.`
-    },
-    'firewall-pro': {
-      agree: `The firewall policies can accommodate this. I've reviewed the rule base and see no conflicts.`,
-      refute: `Hold on — this could break existing NAT rules and VPN tunnels. We need to test in a sandbox first.`,
-      alternative: `What if we implement this with a staged rollout? I can create temporary policies to test the impact.`
-    },
-    'config-keeper': {
-      agree: `Config compliance checks pass. I have backups ready in case we need to rollback.`,
-      refute: `Our compliance framework flags this as a risk. The config drift from baseline would exceed our thresholds.`,
-      alternative: `I suggest we take a config snapshot first, then implement with automated rollback triggers if drift exceeds 15%.`
-    },
-    'netops': {
-      agree: `Network health looks good for this change. Device metrics are within acceptable ranges.`,
-      refute: `Current device utilization is too high for this change window. CPU on core switches is already at 78%.`,
-      alternative: `Let me run pre-checks on all affected devices first. We should establish a baseline before making changes.`
-    },
-    'loadbal-pro': {
-      agree: `F5 pools and VIPs are healthy. Load distribution can handle the proposed changes.`,
-      refute: `This could impact our SSL offloading and pool persistence. I recommend against proceeding without load testing.`,
-      alternative: `We could use traffic mirroring to test the impact before full deployment. I'll set up a shadow pool.`
-    },
-    'router-expert': {
-      agree: `BGP adjacencies and OSPF areas are stable. Routing tables can accommodate this.`,
-      refute: `Route convergence time would increase unacceptably. We risk BGP flapping during the transition.`,
-      alternative: `Let's use BGP communities to implement this gradually across AS boundaries. Safer convergence.`
-    },
-    'monitor-eye': {
-      agree: `Monitoring baselines are stable. I'll set up additional alerting for the change window.`,
-      refute: `Current alert trends show increasing anomalies. We should investigate before making more changes.`,
-      alternative: `I propose we instrument this with enhanced monitoring first — custom Splunk dashboards for the change window.`
-    },
-    'incident-handler': {
-      agree: `No active incidents. Runbook is ready. I'll prepare rollback procedures.`,
-      refute: `We had a similar change cause an outage 3 weeks ago. The RCA findings suggest we're not ready for this.`,
-      alternative: `Let's add this to the change calendar with a proper CAB review. I'll draft the rollback plan.`
-    },
-    'doc-writer': {
-      agree: `Documentation is up to date. I'll prepare the change log and notification.`,
-      refute: `The runbook for this procedure hasn't been updated since Q2. We need to refresh it before proceeding.`,
-      alternative: `I'll create a decision matrix document so we can objectively evaluate all options before committing.`
-    },
-    'jarvis': {
-      agree: `As Squad Lead, I concur. The team has the capacity and the risk is manageable.`,
-      refute: `Let's slow down — I'm seeing conflicting signals from the team. We need alignment before proceeding.`,
-      alternative: `I suggest we break this into smaller tasks and assign them across the squad for parallel evaluation.`
+    // Hand the agent back the status it had before it was pulled in — but a
+    // debate must never be the thing that leaves an agent "active", so a prior
+    // debate status is dropped rather than restored.
+    const wasBusyOnRealWork = priorStatus === 'active' && !/debat/i.test(priorAction || '');
+    updateAgentStatus(
+      agentId,
+      wasBusyOnRealWork ? 'active' : 'idle',
+      wasBusyOnRealWork ? priorAction : 'Debate contribution delivered'
+    );
+  }
+
+  if (thread.status !== 'open') return;
+
+  const summary = generateDebateSummary(thread);
+  const summaryTimestamp = new Date().toISOString();
+
+  thread.messages.push({
+    id: thread.messages.length + 1,
+    agent: 'jarvis',
+    agentName: 'Jarvis',
+    agentIcon: '🎖️',
+    stance: 'summary',
+    text: summary,
+    timestamp: summaryTimestamp
+  });
+  thread.updated = summaryTimestamp;
+
+  broadcast('debate_message', {
+    debateId,
+    message: thread.messages[thread.messages.length - 1]
+  });
+
+  broadcast('chat_message', {
+    type: 'incoming',
+    agent: 'jarvis',
+    agentName: 'Jarvis',
+    agentIcon: '🎖️',
+    text: `⚔️ [Debate Summary] ${summary}\n\nType "resolve" to close this debate, or continue discussing.`,
+    timestamp: summaryTimestamp
+  });
+
+  // Belt and braces: nobody stays "active" because a debate happened.
+  thread.participants.forEach(id => {
+    if (agents[id] && agents[id].status === 'active' &&
+        /debat/i.test(agents[id].lastAction || '')) {
+      updateAgentStatus(id, 'idle', 'Debate contribution delivered');
     }
-  };
-
-  const agentResponses = responses[agentId] || {
-    agree: 'I agree with this approach.',
-    refute: 'I have reservations about this.',
-    alternative: 'I propose an alternative approach.'
-  };
-
-  return { stance, text: agentResponses[stance] };
+  });
 }
+
 
 function getStanceBadge(stance) {
   switch (stance) {
@@ -1488,28 +1422,43 @@ function getStanceBadge(stance) {
     case 'alternative': return '🟡 ALTERNATIVE:';
     case 'propose': return '💡 PROPOSE:';
     case 'summary': return '📊 SUMMARY:';
+    case 'evidence': return '📡 LIVE DATA:';
+    case 'no-data': return '🔌 NO DATA:';
     default: return '';
   }
 }
 
+// The summary counts what actually happened: how many agents brought live
+// readings and how many had nothing to read. Opinion stances (agree/refute/
+// alternative) only ever come from a person typing them into the debate.
 function generateDebateSummary(thread) {
-  const agrees = thread.messages.filter(m => m.stance === 'agree').length;
-  const refutes = thread.messages.filter(m => m.stance === 'refute').length;
-  const alternatives = thread.messages.filter(m => m.stance === 'alternative').length;
-  const total = agrees + refutes + alternatives;
+  const count = (s) => thread.messages.filter(m => m.stance === s).length;
+  const evidence = count('evidence');
+  const noData = count('no-data');
+  const agrees = count('agree');
+  const refutes = count('refute');
+  const alternatives = count('alternative');
 
-  let consensus;
-  if (total === 0) {
-    consensus = 'No positions taken yet.';
-  } else if (agrees > refutes && agrees >= alternatives) {
-    consensus = `Leaning toward consensus (${agrees}/${total} agree). Ready to proceed with caution.`;
-  } else if (refutes > agrees) {
-    consensus = `Significant opposition (${refutes}/${total} refute). Recommend further analysis before proceeding.`;
+  const silent = thread.messages
+    .filter(m => m.stance === 'no-data')
+    .map(m => m.agentName);
+
+  let verdict;
+  if (evidence === 0 && noData === 0) {
+    verdict = 'Nothing read yet.';
+  } else if (evidence === 0) {
+    verdict = 'No live data at all behind this topic — every invited agent is unconnected or its source is down. There is nothing here to decide on.';
   } else {
-    consensus = `Mixed opinions with alternatives proposed (${alternatives}/${total}). Consider hybrid approach.`;
+    verdict = `${evidence} agent(s) brought live readings; ${noData} had no source to read` +
+      (silent.length ? ` (${silent.join(', ')})` : '') +
+      `. Weigh this only on the ${evidence} live reading(s) above — the rest is not evidence either way.`;
   }
 
-  return `📊 **Debate Status: "${thread.topic}"**\n🟢 Agree: ${agrees} | 🔴 Refute: ${refutes} | 🟡 Alternatives: ${alternatives}\n📋 ${consensus}`;
+  const opinions = (agrees + refutes + alternatives)
+    ? `\n🗣 Typed-in positions: 🟢 ${agrees} agree | 🔴 ${refutes} refute | 🟡 ${alternatives} alternative`
+    : '';
+
+  return `📊 **Debate Status: "${thread.topic}"**\n📡 Live data: ${evidence} | 🔌 No data: ${noData}${opinions}\n📋 ${verdict}`;
 }
 
 // Add a message to an active debate
