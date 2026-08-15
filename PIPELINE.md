@@ -11,8 +11,8 @@
 | 2 | Requirements  | pending                                   | — |
 | 3 | UX mock       | pending                                   | — |
 | 4 | Architecture  | pending                                   | — |
-| 5 | Build         | IN PROGRESS — real DevNet data wired, PR open (see below) | branch `feat/real-network-sources` |
-| 6 | Code review   | pending — audit + fix                     | — |
+| 5 | Build         | done — PR #1 MERGED 2026-08-15 (debates live-data-only, all fabrication paths dead); PR #2 MERGED (README, MIT, gitignore) | `main` |
+| 6 | Code review   | IN PROGRESS — full audit done (7 blockers, scratchpad/stage6-audit.md); Tier-1 security fix agent on branch `fix/tier1-security` | scratchpad/stage6-audit.md |
 | 7 | Browser QA    | pending                                   | — |
 | 8 | Ship          | pending — BofA scrub + open-source publish | — |
 | 9 | Learn         | pending                                   | — |
@@ -166,3 +166,16 @@ Secret scan before commit: clean — no credential value or secret pattern in an
 tracked file; `.env.local` absent from `git status`.
 
 Deviations: see implementation-notes.md (to be created at build stage)
+
+## 2026-08-15 session — merges + audit
+- PR #1 merged (72026e2): debates grounded in live reads (930c2ce), ack sweep — no agent
+  names a tool it doesn't have (d7e4c94), C1sco12345 redacted, stuck-active bug fixed.
+  Re-reviewed by an independent agent with live evidence before merge.
+- PR #2 merged (a5e4bb6): README (claims verified against code), MIT license, .gitignore
+  covers scratchpad/, repo description + topics set.
+- Stage 6 audit complete: 7 blockers / 14 major — worst: proven path traversal via
+  /api/files/download, stored XSS via activity feed, wildcard CORS + open WS origin,
+  binds all interfaces. Verdict: home-network only until fixed. Report: scratchpad/stage6-audit.md.
+- Tier-1 security fix agent in flight on `fix/tier1-security` (class fixes: safeJoin,
+  escape-at-every-sink, origin allowlist, 127.0.0.1 default, env SQUAD_ROOT, rate limit).
+- Ship report for Vikas (writeable page): https://claude.ai/code/artifact/7fb38f85-d85d-4fc4-b9a4-069c4f9ca192
