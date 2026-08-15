@@ -9,11 +9,13 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { AsyncLocalStorage } = require('async_hooks');
 
 const live = require('./sources/live-agents');
 const catalyst = require('./sources/catalyst-center');
 const aci = require('./sources/aci');
 const sdwan = require('./sources/sdwan');
+const { checkIntent } = require('./sources/guardrails');
 
 // One module owns where the workspace is and how any caller-supplied path is
 // turned into a real path. Nothing else in this file builds a path from input.
@@ -199,8 +201,36 @@ const server = http.createServer(app);
 // Create WebSocket server
 const wss = new WebSocketServer({ server });
 
+// ── Which question is this answering? ───────────────────────────────────────
+// One store, set once per incoming command, carried across every await and
+// timer that command spawns. Any chat message broadcast inside it is stamped
+// with the question that asked for it, and the UI quotes that question in the
+// reply header. Ordering can then never mis-attribute an answer.
+const requestContext = new AsyncLocalStorage();
+let requestSeq = 0;
+const newRequestId = () => `req-${Date.now().toString(36)}-${(++requestSeq).toString(36)}`;
+
+function currentRequest() {
+  return requestContext.getStore() || null;
+}
+
+// Stamp chat messages with their originating question. Other broadcast types
+// are untouched.
+function withRequest(type, data) {
+  if (type !== 'chat_message' || !data || typeof data !== 'object') return data;
+  const req = currentRequest();
+  if (!req) return data;
+  return {
+    ...data,
+    requestId: data.requestId || req.requestId,
+    inReplyTo: data.inReplyTo || (data.type === 'outgoing' ? null : req.question),
+    inReplyToAgent: data.inReplyToAgent || (agents[req.agent]?.name || null),
+  };
+}
+
 // Broadcast to all connected clients
 function broadcast(type, data) {
+  data = withRequest(type, data);
   const message = JSON.stringify({ type, data, timestamp: new Date().toISOString() });
   clients.forEach(client => {
     if (client.readyState === 1) { // WebSocket.OPEN
@@ -310,8 +340,24 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Handle commands from dashboard
+// Handle commands from dashboard.
+// Everything a command triggers — acknowledgements, live reads, refusals,
+// replies that land 30 seconds later — runs inside one request context, so
+// every message can name the question that caused it. Without that, a slow
+// reply appears under whatever was asked in the meantime and the reader
+// attributes real fault data to the wrong exchange.
 function handleCommand(data) {
+  const question = String((data && data.command) || '');
+  const ctxValue = {
+    requestId: newRequestId(),
+    question,
+    agent: (data && data.agent) || null,
+    askedAt: new Date().toISOString(),
+  };
+  return requestContext.run(ctxValue, () => handleCommandInner(data));
+}
+
+function handleCommandInner(data) {
   const { agent, command } = data;
   const timestamp = new Date().toISOString();
   const agentName = agents[agent]?.name || agent;
@@ -331,6 +377,27 @@ function handleCommand(data) {
     text: command,
     timestamp
   });
+
+  // An @mention nobody answers to is a typo, not a task. Say so and stop —
+  // creating live work against real kit for a name that does not exist is the
+  // same failure as answering a question that was never asked.
+  const unknown = unknownMentionNames(command);
+  if (unknown.length && parseMentions(command).length === 0) {
+    broadcast('chat_message', {
+      type: 'incoming',
+      agent: 'system',
+      agentName: 'Mission Control',
+      agentIcon: '🎯',
+      text:
+        `🤷 There is no agent called @${unknown[0]}.\n` +
+        `I have not created a task and nothing was sent to any device.\n\n` +
+        `The squad is: ${AGENT_IDS.map((id) => `@${agents[id].name}`).join(', ')}.\n` +
+        `Retype the mention with one of those names.`,
+      timestamp,
+    });
+    appendToActivityLog(`[${timestamp}] [Dashboard] Unknown @mention refused: @${unknown[0]}\n`);
+    return;
+  }
 
   // Check if command is an @mention (e.g., "@NetOps run prechecks")
   const mentionMatch = command.match(/^@([A-Za-z][\w-]*)\s+(.*)/);
@@ -402,6 +469,18 @@ function handleCommand(data) {
     // Simulate agent action based on command
     simulateAgentAction(agent, command);
   }, 500);
+}
+
+// @names in the text that match no agent in the squad.
+function unknownMentionNames(text) {
+  const found = [];
+  const re = /@([A-Za-z][\w-]*)/g;
+  let m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    const name = m[1];
+    if (!nameToId[name.toLowerCase()] && name.toLowerCase() !== 'vikas') found.push(name);
+  }
+  return found;
 }
 
 // Parse @mentions from text, returns array of {name, id}
@@ -616,6 +695,15 @@ function runAgentAction(agentId, command) {
   // anything network-shaped falls through to the live sources.
   if (agentId === 'jarvis') return simulateJarvisAction(agentId, command);
 
+  // Destructive intent is judged on the RAW request text, for EVERY network
+  // agent — not just the one that talks to a device CLI. A refusal is always
+  // spoken; nothing is ever quietly swapped for a different command.
+  const writeIntent = checkIntent(command);
+  if (writeIntent.destructive) {
+    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Refused a state-changing request ("${writeIntent.keyword}") — "${command.slice(0, 60)}"\n`);
+    return live.refuseWrite(agentId, command, writeIntent);
+  }
+
   const intent = detectAgentIntent(agentId, command);
   appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Intent: ${intent} — "${command.slice(0, 60)}"\n`);
 
@@ -665,7 +753,8 @@ function showAgentHelp(agentId) {
       `I will not invent a report. Add the credentials to .env.local and I will answer for real.`
     : live.hasLiveBackend(agentId)
       ? `🔍 **Reads I can do (live, read-only)**\n` +
-        `• Ask me in plain English — I answer from a real Cisco DevNet sandbox.\n` +
+        ((live.CAPABILITIES[agentId]?.can || []).map((c) => `• ${c}\n`).join('')) +
+        `• Anything outside that list I will say I cannot answer — I never run a different read instead.\n` +
         `• show / ping / traceroute / dir / more — the only verbs allowed through to a device.\n\n` +
         `🚫 **What I will refuse**\n` +
         `Anything that changes a device: configure, write, reload, erase, shut/no shut, copy, delete.\n` +
@@ -806,30 +895,32 @@ function extractJarvisSubject(input) {
 }
 
 // When intent is genuinely unclear, Jarvis reasons through it and acts
+// Jarvis's dead end. It used to "Roger that" anything it did not understand and
+// then triage it into a real task assigned to a real agent — which sent live
+// device reads off the back of a request nobody could answer. A request Jarvis
+// cannot place is now said out loud, and no work is created.
 function simulateJarvisGeneralResponse(agentId, command) {
   const jarvis = agents[agentId];
-  const subject = extractJarvisSubject(command);
-
-  // Jarvis acknowledges in natural language, then decides what to do
-  const acknowledgements = [
-    `Got it — let me figure out the best way to handle: "${subject}"`,
-    `Understood. Analyzing: "${subject}" — routing to the right agent now.`,
-    `On it. I'll triage "${subject}" to the most relevant squad member.`,
-    `Roger that. Processing: "${subject}"`
-  ];
-  const ack = acknowledgements[Math.floor(Math.random() * acknowledgements.length)];
 
   setTimeout(() => {
     broadcast('chat_message', {
       type: 'incoming', agent: agentId, agentName: jarvis.name, agentIcon: jarvis.icon,
-      text: `🎖️ ${ack}`,
+      text:
+        `🤷 I don't have a way to answer that.\n──────────────────────────────────\n` +
+        `You asked: "${String(command).slice(0, 140)}"\n\n` +
+        `I have created no task and sent nothing to any device. This squad only knows the ` +
+        `network it is wired to — Cisco Catalyst Center, the ACI fabric and the SD-WAN overlay.\n\n` +
+        `Here is what I can actually do:\n` +
+        `• One live picture across every connected source — ask "network overview"\n` +
+        `• Squad standup, roll call and status\n` +
+        `• Triage a piece of network work to an agent — say "triage <the work>"\n` +
+        `• Escalate something to Vikas — say "escalate <the issue>"\n\n` +
+        `Or @mention an agent directly — type "help" for the full list.`,
       timestamp: new Date().toISOString()
     });
-    appendToActivityLog(`[${new Date().toISOString()}] [Jarvis] Processing general request: "${subject}"\n`);
+    appendToActivityLog(`[${new Date().toISOString()}] [Jarvis] No way to answer — ran nothing: "${String(command).slice(0, 60)}"\n`);
+    updateAgentStatus(agentId, 'idle', 'No way to answer that — ran nothing');
   }, 300);
-
-  // Then triage it to the best-fit agent
-  setTimeout(() => simulateTriage(agentId, subject), 1800);
 }
 
 // Main Jarvis entry point — intent-driven, no fixed commands

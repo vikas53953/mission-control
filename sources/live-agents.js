@@ -12,7 +12,7 @@
 const catalyst = require('./catalyst-center');
 const aci = require('./aci');
 const sdwan = require('./sdwan');
-const { checkCommand } = require('./guardrails');
+const { checkCommand, checkIntent, commandWord, READ_VERBS } = require('./guardrails');
 
 // The host app injects its broadcast/status/task-board plumbing here so this
 // module stays free of server internals.
@@ -274,17 +274,48 @@ async function routerExpertSdwan(agentId) {
 // This is the one path that touches a device CLI, so it is the strictest:
 // the guardrail allowlist runs before the request is built.
 async function configKeeper(agentId, command) {
-  const wanted = extractShowCommand(command);
+  const raw = String(command || '');
 
-  const verdict = checkCommand(wanted);
+  // 1. Destructive intent is judged on the RAW text, not on an extracted
+  //    fragment — so "erase startup-config and reload" and "show version;
+  //    write erase" are both refused OUT LOUD instead of being trimmed away.
+  const intent = checkIntent(raw);
+  if (intent.destructive) {
+    refuseWrite(agentId, raw, intent);
+    return;
+  }
+
+  // 2. No read command in the request → say so. Never guess, never substitute.
+  const read = readCommandFrom(raw);
+  if (!read.command) {
+    say(agentId,
+      `${read.note ? '🔌 I cannot answer that one.' : '🤔 I could not find a read command in that.'}\n${RULE}\n` +
+      `You asked: "${raw.slice(0, 140)}"\n\n` +
+      (read.note ? `${read.note}\n\n` : '') +
+      `I will not answer a different question than the one you asked, so I have run nothing.\n` +
+      `I can only run read commands against real kit: ${READ_VERBS.join(' / ')}.\n` +
+      `Tell me which one — for example "show version", "show running-config", ` +
+      `"show ip interface brief" or "ping 10.10.20.48".`);
+    ctx.updateAgentStatus(agentId, 'idle', 'Asked for a read command — ran nothing');
+    return;
+  }
+
+  const verdict = checkCommand(read.command);
   if (!verdict.allowed) {
-    say(agentId, `🚫 ${verdict.reason}\n\nThis squad is read-only against real kit by design. I can run show / ping / traceroute and nothing else.`);
+    say(agentId,
+      `🚫 ${verdict.reason}\n${RULE}\n` +
+      `You asked: "${raw.slice(0, 140)}"\n\n` +
+      `Nothing was sent to any device. This squad is read-only against real kit by design — ` +
+      `I can run ${READ_VERBS.join(' / ')} and nothing else.`);
     ctx.updateAgentStatus(agentId, 'idle', 'Blocked a non-read-only command');
     return;
   }
 
   await runLive(agentId, 'Config read', `Running "${verdict.command}"`, async () => {
-    say(agentId, `📋 Guardrail check passed for "${verdict.command}" (read-only verb).\nSubmitting to Catalyst Center Command Runner — ${catalyst.host}...`);
+    say(agentId,
+      `📋 You asked: "${raw.slice(0, 140)}"\n` +
+      `I read that as the read-only command: "${verdict.command}" — guardrail passed.\n` +
+      `Submitting to Catalyst Center Command Runner — ${catalyst.host}...`);
 
     const devices = await catalyst.getDevices();
     const target = devices.find((d) => d.reachability === 'Reachable');
@@ -306,13 +337,66 @@ async function configKeeper(agentId, command) {
 // Pull the actual CLI command out of plain English. People type
 // "show version on the switches" — the device only understands "show version",
 // so the trailing English is trimmed off before anything is submitted.
-function extractShowCommand(text) {
-  const m = /\b((?:show|ping|traceroute)\b[\w\s|:/.\-]*)/i.exec(text || '');
-  if (!m) return 'show version';
-  return m[1]
-    .replace(/\s+(on|for|from|of|across|in|to|please)\b.*$/i, '')
+//
+// Honesty rule: if there is NO read command in the text, this returns
+// { command: null } and the caller says so. It never falls back to a default,
+// because answering "show version" to a question about backups is answering a
+// question nobody asked.
+//
+// Returns { command, note } — `note` explains, in plain words, why a request
+// that looked like a read produced no runnable command.
+const NO_STORE = /\b(backup|backed[\s-]?up|compliance|drift|baseline|snapshot|golden|archive[sd]?)\b/i;
+
+function readCommandFrom(text) {
+  const raw = String(text || '');
+
+  // Config-Keeper holds no backup archive or compliance baseline. Saying that
+  // out loud beats running a live read and letting it pass as an answer.
+  if (NO_STORE.test(raw)) {
+    return {
+      command: null,
+      note:
+        'I hold no backup archive, compliance baseline or change history — there is no such source wired up, ' +
+        'so I cannot tell you when anything was last backed up or whether it has drifted.\n' +
+        'What I can do is read the device as it is right now (for example "show running-config").',
+    };
+  }
+
+  const m = /\b((?:show|ping|traceroute|dir|more)\b[\w\s|:/.\-]*)/i.exec(raw);
+  if (!m) return { command: null };
+
+  let frag = m[1]
+    .replace(/\s+(on|for|from|of|across|in|please)\b.*$/i, '')
     .replace(/\s+/g, ' ')
-    .trim() || 'show version';
+    .trim();
+
+  // "show me the ..." / "show us ..." is English, not CLI. The article goes too
+  // — "show me the arp table" must not be submitted as "show the arp table".
+  frag = frag
+    .replace(/^show\s+(?:me|us)\b\s*/i, 'show ')
+    .replace(/^show\s+(?:the|my|our|all)\b\s*/i, 'show ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const t = frag.toLowerCase();
+
+  // A bare verb with nothing after it is not a command.
+  if (/^(show|ping|traceroute|dir|more)$/.test(t)) {
+    return { command: null, note: `"${frag}" on its own is not a command — it needs something to read.` };
+  }
+
+  // Map the handful of plain-English phrasings people actually type onto the
+  // real CLI command. The reply always states which command was run, so the
+  // mapping is visible rather than silent.
+  if (/^show\b/.test(t)) {
+    if (/running[\s-]?conf(ig)?/.test(t)) return { command: 'show running-config' };
+    if (/start(up)?[\s-]?conf(ig)?/.test(t)) return { command: 'show startup-config' };
+    if (/\b(version|software|ios|firmware)\b/.test(t)) return { command: 'show version' };
+    if (/\binterface/.test(t)) return { command: 'show ip interface brief' };
+    if (/\binventor(y|ies)\b/.test(t)) return { command: 'show inventory' };
+  }
+
+  return { command: frag };
 }
 
 // Command Runner returns a nested envelope with SUCCESS / FAILURE /
@@ -369,12 +453,18 @@ async function jarvisNetwork(agentId) {
 }
 
 // ── Read-only refusal for any change request ────────────────────────────────
-function refuseWrite(agentId, command) {
+function refuseWrite(agentId, command, intent) {
+  const named = intent && intent.keyword
+    ? `What I refused: "${intent.keyword}"${intent.clause && intent.clause.toLowerCase() !== intent.keyword ? ` — in "${String(intent.clause).slice(0, 80)}"` : ''}. ` +
+      `That changes device state.\n\n`
+    : '';
   say(agentId,
-    `🚫 Read-only. I will not change device configuration.\n${RULE}\n` +
-    `You asked: "${String(command).slice(0, 100)}"\n\n` +
-    `This squad is wired to real Cisco DevNet sandboxes with read-only access enforced in code — ` +
-    `only show / ping / traceroute reads are allowed through. Nothing was sent to any device.`);
+    `🚫 Refused — that is a change, and I am read-only.\n${RULE}\n` +
+    `You asked: "${String(command).slice(0, 140)}"\n\n` +
+    named +
+    `Nothing was sent to any device, and I did NOT run something else in its place.\n` +
+    `This squad is wired to real Cisco DevNet sandboxes with read-only access enforced in code ` +
+    `(sources/guardrails.js) — only ${READ_VERBS.join(' / ')} reads get through.`);
   ctx.updateAgentStatus(agentId, 'idle', 'Refused a write — read-only mode');
 }
 
@@ -597,15 +687,160 @@ const HANDLERS = {
 
 function hasLiveBackend(agentId) { return Boolean(HANDLERS[agentId]); }
 
+// ── What each agent can ACTUALLY answer ─────────────────────────────────────
+// Every agent below has exactly one live action, and it reads one set of
+// sources. Before this map existed the intent router fell through to that
+// action for ANY text, so "what is the weather in Paris today" and "wipe the
+// config on sw1" both came back as a confident live device read — the same
+// silent substitution that Config-Keeper used to do with "show version".
+//
+// So the question is asked FIRST: is this request one this agent can answer?
+// If not, the agent says so and runs nothing. There is no default action.
+//
+// A capability is TWO questions, not one keyword sweep: what is being asked FOR
+// (the subject) and what is being asked to be DONE (the verb). Testing keyword
+// presence alone let an in-domain noun drag an out-of-domain request through —
+// "document my holiday in Spain" wrote a real network inventory file, "backup
+// the inventory" ran a live device read, "is the coffee machine up?" answered
+// with a switch health score. Both halves must land inside the agent's remit.
+//
+//   subjects — the things this agent can actually see. Nouns only.
+//   verbs    — the actions it can actually perform, on top of the shared
+//              question/read openers below. Anything else is out of remit.
+//
+// Verbs people use to ASK for a reading. Every agent accepts these, because
+// every agent's job is to read something and report it back.
+const READ_ASK = [
+  'what', 'whats', 'which', 'who', 'whose', 'when', 'where', 'why', 'how',
+  'is', 'are', 'was', 'were', 'am', 'any', 'anything', 'anyone', 'does', 'did',
+  'has', 'have', 'tell', 'give', 'show', 'list', 'get', 'check', 'read',
+  'report', 'look', 'see', 'display', 'find', 'confirm', 'verify', 'compare',
+  'pull', 'fetch', 'run', 'status', 'update', 'brief', 'catch', 'recap',
+];
+
+const CAPABILITIES = {
+  'netops': {
+    subjects: /\b(device|devices|switch|switches|inventory|reachab|reachable|campus|catalyst|dnac|precheck|pre-check|connectivity|ssh|platform|software|version|uptime|hostname|serial|network|health score|kit|gear|sw\d+)\b/i,
+    verbs: [],
+    can: [
+      'read the campus inventory from Catalyst Center — hostname, management IP, platform, software version, reachability',
+      'report the campus health score (how many devices are good vs bad)',
+    ],
+  },
+  'monitor-eye': {
+    subjects: /\b(alert|alerts|alarm|alarms|threshold|issue|issues|event|events|syslog|snmp|metric|metrics|health|network|catalyst|sd-?wan|vmanage|device|devices)\b/i,
+    verbs: ['monitor', 'watch', 'sweep', 'poll'],
+    can: [
+      'read live alerts and open issues from Catalyst Center',
+      'read active and cleared alarm counts from SD-WAN vManage',
+    ],
+  },
+  'incident-handler': {
+    subjects: /\b(incident|incidents|fault|faults|issue|issues|outage|rca|root[\s-]?cause|impact|severity|critical|major|problem|problems|network|fabric|aci|catalyst|device|devices)\b/i,
+    verbs: ['triage', 'diagnose', 'troubleshoot', 'investigate'],
+    can: [
+      'read open issues from Catalyst Center',
+      'read critical faults from the ACI fabric (when the APIC is reachable)',
+    ],
+  },
+  'doc-writer': {
+    // Note what is NOT here: "document", "write", "report" are verbs, not
+    // subjects. Doc-Writer writes about the network it can read — nothing else.
+    subjects: /\b(network|inventory|device|devices|switch|switches|router|routers|fabric|aci|sd-?wan|overlay|topology|incident|incidents|alarm|alarms|alert|alerts|config|configuration|source|sources|catalyst|as[\s-]?built|estate)\b/i,
+    verbs: ['write', 'document', 'draft', 'produce', 'generate', 'compile', 'record', 'summarise', 'summarize', 'note'],
+    can: [
+      'write a network inventory document from live sources (Catalyst Center, ACI, SD-WAN) and save it as markdown',
+      'log any source it could not reach inside that document, rather than hiding it',
+    ],
+  },
+  'router-expert': {
+    subjects: /\b(aci|apic|fabric|leaf|leaves|spine|spines|tenant|tenants|epg|bd\b|vrf|contract|nexus|sd-?wan|vmanage|overlay|vedge|vedges|controller|controllers|wan|router|routers|routing|bgp|ospf|alarm|alarms|data[\s-]?cent(er|re))\b/i,
+    verbs: ['audit', 'walk', 'trace'],
+    can: [
+      'read the ACI fabric from the APIC — nodes, fabric health, tenants, faults, and a tenant VRF/BD/EPG/contract walk',
+      'read the SD-WAN overlay from vManage — devices, controllers, vEdges and alarm counts',
+    ],
+  },
+  'jarvis': {
+    subjects: /\b(network|overview|picture|estate|all sources|every source|devices?|inventory|fabric|switch(es)?|router|wan|sd-?wan|aci|catalyst|reachab|health)\b/i,
+    verbs: ['poll', 'overview', 'summarise', 'summarize', 'brief'],
+    can: [
+      'poll every connected source at once (Catalyst Center, ACI, SD-WAN) and give one honest cross-network picture',
+      'name which sources are not connected, instead of filling the gap with a guess',
+    ],
+  },
+};
+
+// Honest dead end: this agent has no way to answer, so it answers nothing.
+// `why` says which half of the capability missed, so the reply tells the user
+// something useful instead of a flat "no".
+function cannotAnswer(agentId, command, why) {
+  const cap = CAPABILITIES[agentId];
+  const can = cap ? cap.can : [];
+  let because = '';
+  if (why && !why.subjectOk) {
+    because = `That is not something I can see. I only read the sources listed below — ` +
+      `if it is not on one of them, I have no way to know anything about it.\n\n`;
+  } else if (why && !why.verbOk) {
+    because = `I read and report. I do not "${why.verb}" anything — nothing in this squad ` +
+      `changes, stores or creates state on a device.\n\n`;
+  }
+  say(agentId,
+    `🤷 I don't have a way to answer that.\n${RULE}\n` +
+    `You asked: "${String(command || '').slice(0, 140)}"\n\n` +
+    because +
+    `I have run nothing. I will not answer a different question than the one you asked, ` +
+    `and I will not dress up a reading you did not ask for as the answer.\n\n` +
+    (can.length ? `Here is what I can actually do:\n${can.map((c) => `• ${c}`).join('\n')}\n\n` : '') +
+    `If this belongs to another agent, @mention them — or type "help" to see my full remit.`);
+  ctx.appendToActivityLog(
+    `[${new Date().toISOString()}] [${ctx.agents[agentId]?.name || agentId}] No way to answer — ran nothing: "${String(command || '').slice(0, 60)}"\n`);
+  ctx.updateAgentStatus(agentId, 'idle', 'No way to answer that — ran nothing');
+}
+
+// Can this agent answer this request at all? Config-Keeper has its own, finer
+// gate (readCommandFrom), so it is not listed here.
+//
+// BOTH halves must land: the subject asked about has to be something this agent
+// can see, AND the action asked for has to be something it can do. Either one
+// alone is not a capability — "backup the inventory" is an in-remit noun with an
+// out-of-remit verb, and answering it with a device read would be exactly the
+// substitution this whole branch exists to stop.
+function canAnswer(agentId, command) {
+  const cap = CAPABILITIES[agentId];
+  if (!cap) return { ok: true };
+  const text = String(command || '');
+
+  const subjectOk = cap.subjects.test(text);
+
+  // The verb is the first real word of the request, filler stripped — the same
+  // reading the guardrail uses to spot a destructive command.
+  const verb = commandWord(text);
+  const verbOk = !verb
+    || READ_ASK.includes(verb)
+    || cap.verbs.includes(verb)
+    // A request that opens with its own subject ("device health?", "alarms?")
+    // is a noun phrase, not a different action.
+    || cap.subjects.test(verb);
+
+  return { ok: subjectOk && verbOk, subjectOk, verbOk, verb };
+}
+
 // Entry point used by the dispatcher in server.js.
 function handle(agentId, command) {
   if (NO_BACKEND[agentId]) return notConnected(agentId);
   const fn = HANDLERS[agentId];
   if (!fn) return notConnected(agentId);
+  // Config-Keeper gates itself: it must find a real read command in the text.
+  if (agentId !== 'config-keeper') {
+    const verdict = canAnswer(agentId, command);
+    if (!verdict.ok) return cannotAnswer(agentId, command, verdict);
+  }
   return fn(agentId, command);
 }
 
 module.exports = {
-  init, handle, refuseWrite, notConnected, hasLiveBackend, NO_BACKEND,
+  init, handle, refuseWrite, notConnected, hasLiveBackend, NO_BACKEND, readCommandFrom,
+  canAnswer, cannotAnswer, CAPABILITIES,
   debateContribution,
 };
