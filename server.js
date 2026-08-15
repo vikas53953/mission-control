@@ -9,11 +9,13 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { AsyncLocalStorage } = require('async_hooks');
 
 const live = require('./sources/live-agents');
 const catalyst = require('./sources/catalyst-center');
 const aci = require('./sources/aci');
 const sdwan = require('./sources/sdwan');
+const { checkIntent } = require('./sources/guardrails');
 
 // One module owns where the workspace is and how any caller-supplied path is
 // turned into a real path. Nothing else in this file builds a path from input.
@@ -199,8 +201,36 @@ const server = http.createServer(app);
 // Create WebSocket server
 const wss = new WebSocketServer({ server });
 
+// ── Which question is this answering? ───────────────────────────────────────
+// One store, set once per incoming command, carried across every await and
+// timer that command spawns. Any chat message broadcast inside it is stamped
+// with the question that asked for it, and the UI quotes that question in the
+// reply header. Ordering can then never mis-attribute an answer.
+const requestContext = new AsyncLocalStorage();
+let requestSeq = 0;
+const newRequestId = () => `req-${Date.now().toString(36)}-${(++requestSeq).toString(36)}`;
+
+function currentRequest() {
+  return requestContext.getStore() || null;
+}
+
+// Stamp chat messages with their originating question. Other broadcast types
+// are untouched.
+function withRequest(type, data) {
+  if (type !== 'chat_message' || !data || typeof data !== 'object') return data;
+  const req = currentRequest();
+  if (!req) return data;
+  return {
+    ...data,
+    requestId: data.requestId || req.requestId,
+    inReplyTo: data.inReplyTo || (data.type === 'outgoing' ? null : req.question),
+    inReplyToAgent: data.inReplyToAgent || (agents[req.agent]?.name || null),
+  };
+}
+
 // Broadcast to all connected clients
 function broadcast(type, data) {
+  data = withRequest(type, data);
   const message = JSON.stringify({ type, data, timestamp: new Date().toISOString() });
   clients.forEach(client => {
     if (client.readyState === 1) { // WebSocket.OPEN
@@ -310,8 +340,24 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Handle commands from dashboard
+// Handle commands from dashboard.
+// Everything a command triggers — acknowledgements, live reads, refusals,
+// replies that land 30 seconds later — runs inside one request context, so
+// every message can name the question that caused it. Without that, a slow
+// reply appears under whatever was asked in the meantime and the reader
+// attributes real fault data to the wrong exchange.
 function handleCommand(data) {
+  const question = String((data && data.command) || '');
+  const ctxValue = {
+    requestId: newRequestId(),
+    question,
+    agent: (data && data.agent) || null,
+    askedAt: new Date().toISOString(),
+  };
+  return requestContext.run(ctxValue, () => handleCommandInner(data));
+}
+
+function handleCommandInner(data) {
   const { agent, command } = data;
   const timestamp = new Date().toISOString();
   const agentName = agents[agent]?.name || agent;
@@ -331,6 +377,27 @@ function handleCommand(data) {
     text: command,
     timestamp
   });
+
+  // An @mention nobody answers to is a typo, not a task. Say so and stop —
+  // creating live work against real kit for a name that does not exist is the
+  // same failure as answering a question that was never asked.
+  const unknown = unknownMentionNames(command);
+  if (unknown.length && parseMentions(command).length === 0) {
+    broadcast('chat_message', {
+      type: 'incoming',
+      agent: 'system',
+      agentName: 'Mission Control',
+      agentIcon: '🎯',
+      text:
+        `🤷 There is no agent called @${unknown[0]}.\n` +
+        `I have not created a task and nothing was sent to any device.\n\n` +
+        `The squad is: ${AGENT_IDS.map((id) => `@${agents[id].name}`).join(', ')}.\n` +
+        `Retype the mention with one of those names.`,
+      timestamp,
+    });
+    appendToActivityLog(`[${timestamp}] [Dashboard] Unknown @mention refused: @${unknown[0]}\n`);
+    return;
+  }
 
   // Check if command is an @mention (e.g., "@NetOps run prechecks")
   const mentionMatch = command.match(/^@([A-Za-z][\w-]*)\s+(.*)/);
@@ -402,6 +469,18 @@ function handleCommand(data) {
     // Simulate agent action based on command
     simulateAgentAction(agent, command);
   }, 500);
+}
+
+// @names in the text that match no agent in the squad.
+function unknownMentionNames(text) {
+  const found = [];
+  const re = /@([A-Za-z][\w-]*)/g;
+  let m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    const name = m[1];
+    if (!nameToId[name.toLowerCase()] && name.toLowerCase() !== 'vikas') found.push(name);
+  }
+  return found;
 }
 
 // Parse @mentions from text, returns array of {name, id}
@@ -615,6 +694,15 @@ function runAgentAction(agentId, command) {
   // Jarvis keeps its squad-coordination intents (standup, roll call, triage);
   // anything network-shaped falls through to the live sources.
   if (agentId === 'jarvis') return simulateJarvisAction(agentId, command);
+
+  // Destructive intent is judged on the RAW request text, for EVERY network
+  // agent — not just the one that talks to a device CLI. A refusal is always
+  // spoken; nothing is ever quietly swapped for a different command.
+  const writeIntent = checkIntent(command);
+  if (writeIntent.destructive) {
+    appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Refused a state-changing request ("${writeIntent.keyword}") — "${command.slice(0, 60)}"\n`);
+    return live.refuseWrite(agentId, command, writeIntent);
+  }
 
   const intent = detectAgentIntent(agentId, command);
   appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] Intent: ${intent} — "${command.slice(0, 60)}"\n`);

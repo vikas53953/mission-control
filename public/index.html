@@ -673,6 +673,19 @@
       border-bottom-left-radius: 2px;
     }
 
+    /* Quote of the question a reply is answering. Shown whenever the reply
+       belongs to a different question than the line above it, so a late answer
+       can never be read as the answer to a later question. */
+    .reply-quote {
+      border-left: 3px solid var(--accent);
+      padding: 0.2rem 0 0.2rem 0.5rem;
+      margin-bottom: 0.4rem;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      font-style: italic;
+      overflow-wrap: anywhere;
+    }
+
     .chat-input-container {
       display: flex;
       gap: 0.5rem;
@@ -1481,14 +1494,21 @@
       background: var(--bg-hover);
     }
 
-    .consensus-agree {
+    /* Share of the bar that is live readings from a real source. */
+    .consensus-evidence {
       background: var(--success);
     }
 
-    /* "no data" / refute share — deliberately neutral, not alarm red:
-       an agent with no source is not opposition, it is an absence of evidence */
-    .consensus-refute {
+    /* "no data" share — deliberately neutral, never alarm red: an agent with
+       no source has not disagreed with anything, it simply has nothing. */
+    .consensus-nodata {
       background: var(--text-secondary);
+    }
+
+    .consensus-legend {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      margin: -0.25rem 0 0.4rem;
     }
 
     .consensus-alt {
@@ -1779,6 +1799,9 @@
     <!-- Right: time + connection + profile -->
     <div class="header-right">
       <span class="live-time" id="liveTime">--:--:--</span>
+      <!-- Pause is a real control: it suspends agent heartbeats server-side.
+           If the server refuses it, the button says so instead of pretending. -->
+      <button class="pause-btn" id="pauseBtn" onclick="togglePause()" title="Suspend agent heartbeats">⏸ PAUSE</button>
       <div class="status-badge disconnected" id="connectionStatus">
         <span class="status-dot"></span>
         <span id="connectionText">Connecting...</span>
@@ -1941,10 +1964,11 @@
               <div class="debate-thread-title" id="debateThreadTitle">Topic</div>
               <div class="debate-participants" id="debateThreadParticipants">Participants</div>
               <div class="consensus-bar" id="consensusBar">
-                <div class="consensus-agree" id="consensusAgree" style="width: 0%"></div>
-                <div class="consensus-refute" id="consensusRefute" style="width: 0%"></div>
+                <div class="consensus-evidence" id="consensusEvidence" style="width: 0%"></div>
+                <div class="consensus-nodata" id="consensusNoData" style="width: 0%"></div>
                 <div class="consensus-alt" id="consensusAlt" style="width: 0%"></div>
               </div>
+              <div class="consensus-legend" id="consensusLegend">Nothing read yet</div>
             </div>
             <div class="debate-messages" id="debateMessages"></div>
           </div>
@@ -2339,9 +2363,9 @@
 
         case 'chat_message':
           if (data.type === 'outgoing') {
-            addChatMessage(data.text, 'outgoing', null, null, timestamp);
+            addChatMessage(data.text, 'outgoing', null, null, timestamp, null, data);
           } else {
-            addChatMessage(data.text, 'incoming', data.agentName, data.agentIcon, timestamp, data.agent);
+            addChatMessage(data.text, 'incoming', data.agentName, data.agentIcon, timestamp, data.agent, data);
           }
           break;
 
@@ -2664,7 +2688,13 @@
       return escaped.replace(/@([A-Za-z][\w-]*)/g, '<span class="mention">@$1</span>');
     }
 
-    function addChatMessage(text, type, agentName = null, agentIcon = null, timestamp = null, agentId = null) {
+    // Which question the last rendered chat line belonged to. A reply whose
+    // question differs from the line above it gets the question quoted in its
+    // header — so a slow answer that lands under a later question can never be
+    // read as the answer to that later question.
+    let lastRenderedRequestId = null;
+
+    function addChatMessage(text, type, agentName = null, agentIcon = null, timestamp = null, agentId = null, meta = null) {
       const ts = timestamp ? new Date(timestamp) : new Date();
       const timeStr = ts.toLocaleTimeString('en-US', { hour12: false });
 
@@ -2681,6 +2711,20 @@
 
       const div = document.createElement('div');
       div.className = `chat-message ${type}`;
+
+      const requestId = meta && meta.requestId ? meta.requestId : null;
+      if (requestId) div.dataset.requestId = requestId;
+
+      // Slack-style quote of the question this reply answers.
+      const askedQuestion = meta && meta.inReplyTo ? meta.inReplyTo : null;
+      if (type === 'incoming' && askedQuestion && requestId && requestId !== lastRenderedRequestId) {
+        const quote = document.createElement('div');
+        quote.className = 'reply-quote';
+        const who = meta.inReplyToAgent ? ` to ${meta.inReplyToAgent}` : '';
+        quote.textContent = `↩ answering your question${who}: "${askedQuestion.length > 120 ? askedQuestion.slice(0, 120) + '…' : askedQuestion}"`;
+        div.appendChild(quote);
+      }
+      lastRenderedRequestId = requestId;
 
       if (type === 'incoming' && agentName) {
         const header = document.createElement('div');
@@ -3449,23 +3493,45 @@
       messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
+    // This bar counts SOURCES READ, not opinions. An agent with no source has
+    // not disagreed with anything — calling that "refute" manufactured a
+    // consensus nobody expressed, which is exactly what this build removes.
     function updateConsensusBar(debateId) {
       const debate = debates.find(d => d.id === debateId);
       if (!debate) return;
 
-      // Green = agents that brought live readings, grey = agents with no data,
-      // amber = alternatives typed in by a person.
       const count = s => debate.messages.filter(m => m.stance === s).length;
-      const agrees = count('evidence') + count('agree');
-      const refutes = count('no-data') + count('refute');
-      const alts = count('alternative');
-      const total = agrees + refutes + alts;
+      const evidence = count('evidence');                 // live readings came back
+      const noData = count('no-data');                    // no source, or unreachable
+      // Notes a person typed in. The opening 'propose' and the closing
+      // 'summary' are not readings, so they are not counted at all.
+      const alts = count('alternative') + count('agree') + count('refute');
+      const total = evidence + noData + alts;
 
-      if (total === 0) return;
+      const bar = document.getElementById('consensusEvidence');
+      const grey = document.getElementById('consensusNoData');
+      const amber = document.getElementById('consensusAlt');
+      const legend = document.getElementById('consensusLegend');
+      if (!bar || !grey || !amber) return;
 
-      document.getElementById('consensusAgree').style.width = `${(agrees / total) * 100}%`;
-      document.getElementById('consensusRefute').style.width = `${(refutes / total) * 100}%`;
-      document.getElementById('consensusAlt').style.width = `${(alts / total) * 100}%`;
+      if (total === 0) {
+        bar.style.width = '0%';
+        grey.style.width = '0%';
+        amber.style.width = '0%';
+        if (legend) legend.textContent = 'Nothing read yet';
+        return;
+      }
+
+      bar.style.width = `${(evidence / total) * 100}%`;
+      grey.style.width = `${(noData / total) * 100}%`;
+      amber.style.width = `${(alts / total) * 100}%`;
+
+      if (legend) {
+        const parts = [`${evidence} source${evidence === 1 ? '' : 's'} read`];
+        parts.push(`${noData} no data`);
+        if (alts) parts.push(`${alts} typed-in note${alts === 1 ? '' : 's'}`);
+        legend.textContent = `${parts.join(' · ')} — this counts readings, not votes.`;
+      }
     }
 
     function updateDebateCountBadge() {
@@ -3622,29 +3688,46 @@
 
     // ============ PAUSE / RESUME ============
     function togglePause() {
-      const endpoint = isPaused ? '/api/resume' : '/api/pause';
+      const btn = document.getElementById('pauseBtn');
+      const wantPaused = !isPaused;
+      const endpoint = wantPaused ? '/api/pause' : '/api/resume';
+      if (btn) { btn.disabled = true; btn.textContent = wantPaused ? '⏸ pausing…' : '▶ resuming…'; }
       fetch(endpoint, { method: 'POST' })
-        .then(r => r.json())
+        .then(r => {
+          if (!r.ok) throw new Error(`server said ${r.status}`);
+          return r.json();
+        })
         .then(d => {
+          if (!d || typeof d.paused !== 'boolean') throw new Error('server did not report a pause state');
           isPaused = d.paused;
+          if (btn) btn.disabled = false;
           applyPauseState();
+        })
+        .catch(err => {
+          // Honest about its own failure: the button never shows a state the
+          // server did not confirm.
+          if (btn) btn.disabled = false;
+          applyPauseState();
+          addChatMessage(
+            `⚠️ ${wantPaused ? 'Pause' : 'Resume'} did not go through — ${err.message}. ` +
+            `The system is still ${isPaused ? 'PAUSED' : 'RUNNING'}. Nothing was changed.`,
+            'incoming', 'Mission Control', '🎯', new Date().toISOString(), null
+          );
         });
     }
 
     function applyPauseState() {
       const btn = document.getElementById('pauseBtn');
       const banner = document.getElementById('pausedBanner');
-      if (isPaused) {
-        btn.textContent = '▶ RESUME';
-        btn.classList.add('paused');
-        banner.classList.add('visible');
-        document.body.classList.add('is-paused');
-      } else {
-        btn.textContent = '⏸ PAUSE';
-        btn.classList.remove('paused');
-        banner.classList.remove('visible');
-        document.body.classList.remove('is-paused');
+      if (btn) {
+        btn.textContent = isPaused ? '▶ RESUME' : '⏸ PAUSE';
+        btn.classList.toggle('paused', !!isPaused);
+        btn.title = isPaused
+          ? 'Agent heartbeats are suspended — click to resume'
+          : 'Suspend agent heartbeats';
       }
+      if (banner) banner.classList.toggle('visible', !!isPaused);
+      document.body.classList.toggle('is-paused', !!isPaused);
     }
 
     // ============ FILTER PILLS ============
