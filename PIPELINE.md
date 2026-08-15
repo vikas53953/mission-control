@@ -204,3 +204,12 @@ Stage 2 (Requirements) in progress — gate page to Vikas.
 All five requirement sections LIKED: idea, L1/L2/L3/manager tiers, triage flow,
 screen changes, measurable bars. Gate page: https://claude.ai/code/artifact/874189f3-de9d-41db-adb6-3fc238663960
 Stage 3 (Mocks) started — 3 structurally different clickable directions.
+
+### Security PR #3 — MERGED 2026-08-15 (a56eba5)
+All 7 audit blockers fixed, adversarially re-verified by an independent reviewer
+(28 traversal variants + 8 invented bypasses all refused; XSS 0-executions in 6
+placements; foreign-origin refused; localhost bind; portable workspace; rate
+limits). Reviewer also routed 3 missed writes through safeWrite (9c76c55).
+Remaining Tier-1: AUTH — queued as its own feature. Screenshot PR #4 was closed
++ branch deleted (showed real task board publicly; redo with clean board, show
+Vikas first). Stage 6 = done. Ship report page updated.
