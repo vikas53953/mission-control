@@ -213,3 +213,11 @@ limits). Reviewer also routed 3 missed writes through safeWrite (9c76c55).
 Remaining Tier-1: AUTH — queued as its own feature. Screenshot PR #4 was closed
 + branch deleted (showed real task board publicly; redo with clean board, show
 Vikas first). Stage 6 = done. Ship report page updated.
+
+### Triage feature — Stage 3 mocks delivered (Gate 2 open)
+A war room: https://claude.ai/code/artifact/b349d2b3-217c-431a-811a-c4abe9464988
+B Slack thread: https://claude.ai/code/artifact/8451e8d9-1820-462e-80f2-dd783abb0296
+C evidence console: https://claude.ai/code/artifact/4b01ea82-8009-4c78-b083-f6788dab2bc2
+Pick page (recommendation: C, A's takeover addable later as P1 mode):
+https://claude.ai/code/artifact/5ffa5dc5-4b3a-4ada-b979-036ff5636456
+Awaiting Vikas's pick. Stage 7 QA done (1 blocker 4 major → fix/qa-honesty in flight).
