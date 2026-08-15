@@ -199,3 +199,8 @@ UI; no such agents exist in code — to be checked with him.
    Jarvis picks relevant fronts; not-connected agents stay OFF the bridge,
    named as blind spots in the summary.
 Stage 2 (Requirements) in progress — gate page to Vikas.
+
+### Triage feature — GATE 1 APPROVED (Vikas, 2026-08-15, via feedback layer)
+All five requirement sections LIKED: idea, L1/L2/L3/manager tiers, triage flow,
+screen changes, measurable bars. Gate page: https://claude.ai/code/artifact/874189f3-de9d-41db-adb6-3fc238663960
+Stage 3 (Mocks) started — 3 structurally different clickable directions.
