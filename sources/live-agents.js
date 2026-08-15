@@ -370,8 +370,13 @@ function readCommandFrom(text) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // "show me the ..." / "show us ..." is English, not CLI.
-  frag = frag.replace(/^show\s+(me|us)\b\s*/i, 'show ').replace(/\s+/g, ' ').trim();
+  // "show me the ..." / "show us ..." is English, not CLI. The article goes too
+  // — "show me the arp table" must not be submitted as "show the arp table".
+  frag = frag
+    .replace(/^show\s+(?:me|us)\b\s*/i, 'show ')
+    .replace(/^show\s+(?:the|my|our|all)\b\s*/i, 'show ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
   const t = frag.toLowerCase();
 

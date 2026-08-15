@@ -71,11 +71,14 @@ function checkCommand(command) {
 }
 
 // Split plain English into command clauses. A destructive verb hiding after a
-// ";", a "|", "&&", "then" or "after that" is still a command, so each clause
-// is judged on its own.
+// ";", a "|", "&&", a comma, or a joining word like "then" / "before" / "once"
+// is still a command, so each clause is judged on its own. Miss a separator and
+// a request like "show version after you reload the router" reads as a plain
+// show — the read runs and the reload is dropped without a word, which is the
+// silent substitution this whole file exists to prevent.
 function clausesOf(text) {
   return String(text || '')
-    .split(/[;&|\n\r]+|\band then\b|\bafter that\b|\bthen\b|\band\b/i)
+    .split(/[;&|,\n\r]+|\band then\b|\bafter that\b|\bthen\b|\band\b|\bbefore\b|\bafter\b|\bonce\b|\bwhile\b|\bunless\b|\bbut\b|\bso\b|\balso\b/i)
     .map((c) => c.trim())
     .filter(Boolean);
 }
@@ -102,6 +105,10 @@ function checkIntent(text) {
     const word = commandWord(clause);
     if (!word) continue;
     if (READ_VERBS.includes(word)) continue; // a read clause is a read clause
+    // A clause that is nothing but the word "no" is the English "no", not the
+    // Cisco "no <command>" — "no, show me the version" must not be refused.
+    // "no shut" still has a second word, so it is still judged a change.
+    if (word === 'no' && /^no\W*$/i.test(clause.trim())) continue;
     if (STATE_CHANGING.includes(word)) {
       return { destructive: true, keyword: word, clause: clause.trim() };
     }
