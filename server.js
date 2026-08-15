@@ -445,11 +445,9 @@ function handleMention(fromAgentId, toAgentId, message) {
 
   // Log to MENTIONS.md
   const logEntry = `[${timestamp}] [@${fromAgent.name} → @${toAgent.name}] ${message}\n`;
-  try {
-    fs.appendFileSync(PATHS.mentionsLog, logEntry);
-  } catch (e) {
-    // Create file if it doesn't exist
-    fs.writeFileSync(PATHS.mentionsLog, `# Agent @Mentions Log\n\n${logEntry}`);
+  if (!safeAppend(PATHS.mentionsLog, logEntry, 'mentions log')) {
+    // Fall back to creating the file, still without being able to throw.
+    safeWrite(PATHS.mentionsLog, `# Agent @Mentions Log\n\n${logEntry}`, 'mentions log');
   }
 
   // Log to activity
@@ -1052,7 +1050,9 @@ ${managedAgents.map(id => {
 
     const reportName = `weekly-report-${Date.now()}.md`;
     const reportPath = path.join(SQUAD_ROOT, 'agents', 'jarvis', reportName);
-    fs.writeFileSync(reportPath, reportContent);
+    // Runs inside a timer — a raw write here would throw where nothing can
+    // catch it and would silently abandon the rest of the report.
+    safeWrite(reportPath, reportContent, `weekly report ${reportName}`);
 
     broadcast('chat_message', {
       type: 'incoming', agent: agentId, agentName: jarvis.name, agentIcon: jarvis.icon,
@@ -1076,13 +1076,15 @@ function simulateEscalation(agentId, command) {
   setTimeout(() => {
     // Write to ALERTS.md
     const alertEntry = `- [${new Date().toISOString()}] [Jarvis] 🚨 ESCALATION: ${issue}\n`;
+    // Runs inside a timer — every branch must be unable to throw.
+    let updated = null;
     try {
       const alertsContent = fs.readFileSync(PATHS.alertsFile, 'utf-8');
-      const updated = alertsContent.replace('## CRITICAL\n', `## CRITICAL\n${alertEntry}`);
-      fs.writeFileSync(PATHS.alertsFile, updated);
+      updated = alertsContent.replace('## CRITICAL\n', `## CRITICAL\n${alertEntry}`);
     } catch (e) {
-      fs.writeFileSync(PATHS.alertsFile, `# Alerts\n\n## CRITICAL\n${alertEntry}\n## WARNING\n\n## INFO\n`);
+      updated = `# Alerts\n\n## CRITICAL\n${alertEntry}\n## WARNING\n\n## INFO\n`;
     }
+    safeWrite(PATHS.alertsFile, updated, 'alerts file');
 
     broadcast('chat_message', {
       type: 'incoming', agent: agentId, agentName: jarvis.name, agentIcon: jarvis.icon,
