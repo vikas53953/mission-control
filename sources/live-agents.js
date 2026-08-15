@@ -42,8 +42,10 @@ function notConnected(agentId) {
 async function runLive(agentId, taskTitle, busyLabel, worker) {
   const agent = ctx.agents[agentId];
   ctx.updateAgentStatus(agentId, 'active', busyLabel);
-  ctx.addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
   try {
+    // Inside the try: a task-board problem must not abort the live read, and
+    // must not escape as an unhandled rejection.
+    ctx.addTaskToBoard('inProgress', { title: taskTitle, agent: agent.name });
     await worker();
     ctx.appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ${taskTitle} — live data returned\n`);
     ctx.updateAgentStatus(agentId, 'idle', `${taskTitle} complete (live data)`);
@@ -54,7 +56,11 @@ async function runLive(agentId, taskTitle, busyLabel, worker) {
     ctx.appendToActivityLog(`[${new Date().toISOString()}] [${agent.name}] ${taskTitle} FAILED — ${err.message}\n`);
     ctx.updateAgentStatus(agentId, 'idle', 'Source unreachable');
   }
-  ctx.moveTaskOnBoard(taskTitle, 'inProgress', 'done');
+  try {
+    ctx.moveTaskOnBoard(taskTitle, 'inProgress', 'done');
+  } catch (err) {
+    console.error('[live] Could not tidy the task board:', err.message);
+  }
 }
 
 const pad = (s, n) => String(s == null ? '' : s).padEnd(n);

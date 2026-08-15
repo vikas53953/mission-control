@@ -8,6 +8,8 @@ npm-debug.log*
 
 # Local working files
 scratchpad/
+# Default workspace, created on first run
+squad/
 *.log
 .DS_Store
 Thumbs.db

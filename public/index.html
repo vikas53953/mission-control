@@ -2327,6 +2327,12 @@
           renderActivity(data, true);
           break;
 
+        case 'system_error':
+          // The server hit a problem (a file it could not write, a job that
+          // failed). Say so here instead of dying quietly in a terminal.
+          addChatMessage(`⚠️ ${data.message}`, 'incoming', 'System', '⚠️', timestamp);
+          break;
+
         case 'command_sent':
           // Handled by chat_message now
           break;
@@ -2414,34 +2420,34 @@
         const badgeHtml = mCount > 0 ? `<span class="mention-badge">${mCount}</span>` : '';
 
         return `
-          <div class="agent-card ${isLead ? 'squad-lead' : ''}" id="agent-card-${agent.id}" onclick="openAgentChat('${agent.id}')" style="cursor:pointer;">
+          <div class="agent-card ${isLead ? 'squad-lead' : ''}" id="agent-card-${escapeHtml(agent.id)}" data-agent-id="${escapeHtml(agent.id)}" onclick="openAgentChat(this.dataset.agentId)" style="cursor:pointer;">
             <div class="agent-header">
               <span class="agent-name">
-                <span class="agent-icon">${agent.icon || '🤖'}</span>
-                ${agent.name}
+                <span class="agent-icon">${escapeHtml(agent.icon || '🤖')}</span>
+                ${escapeHtml(agent.name)}
                 ${isLead ? '<span class="agent-role-tag">LEAD</span>' : ''}
                 ${badgeHtml}
               </span>
-              <span class="agent-status ${statusClass}">
-                ${statusEmoji} ${statusClass}
+              <span class="agent-status ${escapeHtml(statusClass)}">
+                ${statusEmoji} ${escapeHtml(statusClass)}
               </span>
             </div>
-            <div class="agent-desc" title="${agent.description || ''}">${agent.description || 'No description'}</div>
-            <div class="agent-action" title="${agent.lastAction || ''}">${agent.lastAction || 'No recent activity'}</div>
+            <div class="agent-desc" title="${escapeHtml(agent.description || '')}">${escapeHtml(agent.description || 'No description')}</div>
+            <div class="agent-action" title="${escapeHtml(agent.lastAction || '')}">${escapeHtml(agent.lastAction || 'No recent activity')}</div>
           </div>
         `;
       }).join('');
 
       // Update command center agent select
       agentSelect.innerHTML = agents.map(a =>
-        `<option value="${a.id}">${a.icon || '🤖'} ${a.name}</option>`
+        h`<option value="${a.id}">${(a.icon || '🤖') + ' ' + a.name}</option>`
       ).join('');
 
       // Update task modal agent select
       const taskAgentEl = document.getElementById('taskAgentSelect');
       if (taskAgentEl) {
         taskAgentEl.innerHTML = '<option value="">-- No Agent --</option>' +
-          agents.map(a => `<option value="${a.name}">${a.icon || '🤖'} ${a.name}</option>`).join('');
+          agents.map(a => h`<option value="${a.name}">${(a.icon || '🤖') + ' ' + a.name}</option>`).join('');
       }
     }
 
@@ -2547,15 +2553,15 @@
             const realIdx = (tasks[col] || []).indexOf(task);
             const taskData = encodeURIComponent(JSON.stringify({...task, column: col, index: realIdx}));
             html += `
-              <div class="task-item" onclick="openEditTaskModal('${taskData}')">
+              <div class="task-item" data-task="${escapeHtml(taskData)}" onclick="openEditTaskModal(this.dataset.task)">
                 <div class="task-card-top">
-                  <span class="priority-badge priority-${priority}">${getPriorityIcon(priority)} ${priority}</span>
-                  ${task.agent ? `<span class="task-agent-avatar" title="${task.agent}">${agentIcon}</span>` : ''}
+                  <span class="priority-badge priority-${escapeHtml(priority)}">${getPriorityIcon(priority)} ${escapeHtml(priority)}</span>
+                  ${task.agent ? h`<span class="task-agent-avatar" title="${task.agent}">${agentIcon}</span>` : ''}
                 </div>
                 <div class="task-title">${escapeHtml(task.title)}</div>
                 ${task.description ? `<div class="task-desc-preview">${escapeHtml(task.description)}</div>` : ''}
                 <div class="task-footer-row">
-                  ${task.agent ? `<span class="task-agent-tag">${task.agent}</span>` : '<span></span>'}
+                  ${task.agent ? h`<span class="task-agent-tag">${task.agent}</span>` : '<span></span>'}
                   <span class="task-time">${task.createdAt ? timeAgo(task.createdAt) : ''}</span>
                 </div>
                 <div class="task-actions" onclick="event.stopPropagation()">
@@ -2586,9 +2592,9 @@
           <div class="file-item">
             <div class="file-info">
               <span class="file-icon">${icon}</span>
-              <span class="file-name" title="${file.name}">${file.name}</span>
+              <span class="file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
             </div>
-            <button class="file-download" onclick="downloadFile('${file.name}')">
+            <button class="file-download" data-name="${escapeHtml(file.name)}" onclick="downloadFile(this.dataset.name)">
               Download
             </button>
           </div>
@@ -2616,10 +2622,10 @@
       return `
         <div class="activity-item ${isNew ? 'new-item' : ''}">
           <div class="activity-header">
-            <span class="activity-agent" style="color:${color};">${categoryIcon} ${activity.agent}</span>
-            <span class="activity-time">${formatTime(activity.timestamp)}</span>
+            <span class="activity-agent" style="color:${escapeHtml(color)};">${categoryIcon} ${escapeHtml(activity.agent)}</span>
+            <span class="activity-time">${escapeHtml(formatTime(activity.timestamp))}</span>
           </div>
-          <div class="activity-message">${activity.message}</div>
+          <div class="activity-message">${escapeHtml(activity.message)}</div>
         </div>
       `;
     }
@@ -2900,7 +2906,7 @@
         const data = await response.json();
 
         if (data.error) {
-          fileListPanel.innerHTML = `<div class="empty-state">Error: ${data.error}</div>`;
+          fileListPanel.innerHTML = h`<div class="empty-state">Error: ${data.error}</div>`;
           return;
         }
 
@@ -2921,14 +2927,15 @@
       const relativePath = data.path.replace(root, '').replace(/^[\\/]/, '');
       const segments = relativePath ? relativePath.split(/[\\/]/) : [];
 
-      let html = `<span class="path-segment" onclick="browseTo('')">🏠 agents</span>`;
+      let html = `<span class="path-segment" data-path="" onclick="browseTo(this.dataset.path)">🏠 agents</span>`;
 
       let cumulativePath = root;
       segments.forEach((segment, idx) => {
         cumulativePath = cumulativePath + '\\' + segment;
-        const pathToUse = cumulativePath;
+        // Paths and names go in a data attribute, not inside a quoted onclick
+        // string — a file named with a quote can no longer break out and run.
         html += `<span class="path-separator">/</span>`;
-        html += `<span class="path-segment" onclick="browseTo('${pathToUse.replace(/\\/g, '\\\\')}')">${segment}</span>`;
+        html += h`<span class="path-segment" data-path="${cumulativePath}" onclick="browseTo(this.dataset.path)">${segment}</span>`;
       });
 
       browserPath.innerHTML = html;
@@ -2939,8 +2946,8 @@
 
       // Add parent directory link
       if (data.parent) {
-        html += `
-          <div class="file-list-item parent" onclick="browseTo('${data.parent.replace(/\\/g, '\\\\')}')">
+        html += h`
+          <div class="file-list-item parent" data-path="${data.parent}" onclick="browseTo(this.dataset.path)">
             <span class="file-list-icon">⬆️</span>
             <span class="file-list-name">..</span>
             <span class="file-list-meta">Parent folder</span>
@@ -2952,13 +2959,13 @@
         data.items.forEach(item => {
           const icon = item.isDirectory ? '📁' : getFileIconForBrowser(item.name);
           const size = item.isDirectory ? '' : formatFileSize(item.size);
-          const escapedPath = item.path.replace(/\\/g, '\\\\');
+          const action = item.isDirectory ? 'browseTo' : 'previewFile';
 
           html += `
-            <div class="file-list-item" onclick="${item.isDirectory ? `browseTo('${escapedPath}')` : `previewFile('${escapedPath}')`}">
+            <div class="file-list-item" data-path="${escapeHtml(item.path)}" onclick="${action}(this.dataset.path, event)">
               <span class="file-list-icon">${icon}</span>
-              <span class="file-list-name">${item.name}</span>
-              <span class="file-list-meta">${size}</span>
+              <span class="file-list-name">${escapeHtml(item.name)}</span>
+              <span class="file-list-meta">${escapeHtml(size)}</span>
             </div>
           `;
         });
@@ -2969,24 +2976,25 @@
       fileListPanel.innerHTML = html || '<div class="empty-state">Empty folder</div>';
     }
 
-    async function previewFile(filePath) {
+    async function previewFile(filePath, evt) {
       try {
         currentFilePath = filePath;
 
         // Highlight selected file
+        const clicked = (evt || window.event)?.currentTarget;
         document.querySelectorAll('.file-list-item').forEach(el => el.classList.remove('active'));
-        event.currentTarget.classList.add('active');
+        if (clicked) clicked.classList.add('active');
 
         const response = await fetch(`/api/browse?path=${encodeURIComponent(filePath)}`);
         const data = await response.json();
 
         if (data.error) {
-          previewContent.innerHTML = `<div class="file-preview-empty">Error: ${data.error}</div>`;
+          previewContent.innerHTML = h`<div class="file-preview-empty">Error: ${data.error}</div>`;
           return;
         }
 
         previewHeader.style.display = 'flex';
-        previewName.innerHTML = `${getFileIconForBrowser(data.name)} ${data.name}`;
+        previewName.textContent = `${getFileIconForBrowser(data.name)} ${data.name}`;
 
         if (data.binary) {
           previewContent.innerHTML = `
@@ -3040,10 +3048,26 @@
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
+    // ============ ESCAPING — one helper, used at every HTML sink ============
+    // Anything that came from the server (agent names, activity lines, task
+    // titles, file names, error text) is treated as text, never as markup.
+    // Quotes are escaped too, so the same helper is safe inside an attribute.
+    const HTML_ESCAPES = {
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;'
+    };
+
     function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
+      if (text === null || text === undefined) return '';
+      return String(text).replace(/[&<>"'`]/g, (c) => HTML_ESCAPES[c]);
+    }
+
+    // Tagged template: h`<div>${untrusted}</div>` escapes every ${...} slot.
+    // Use this for new markup so the next panel is safe by construction.
+    function h(strings, ...values) {
+      return strings.reduce(
+        (out, str, i) => out + str + (i < values.length ? escapeHtml(values[i]) : ''),
+        ''
+      );
     }
 
     // ============ SETTINGS & THEMES ============
@@ -3344,14 +3368,14 @@
         const msgCount = d.messages ? d.messages.length : 0;
 
         return `
-          <div class="debate-thread-item ${d.status}" onclick="viewDebateThread(${d.id})">
+          <div class="debate-thread-item ${escapeHtml(d.status)}" onclick="viewDebateThread(${Number(d.id)})">
             <div style="display: flex; justify-content: space-between; align-items: center;">
               <div class="debate-topic">⚔️ ${escapeHtml(d.topic)}</div>
-              <span class="debate-status-tag ${d.status}">${d.status}</span>
+              <span class="debate-status-tag ${escapeHtml(d.status)}">${escapeHtml(d.status)}</span>
             </div>
             <div class="debate-meta">
-              <span>${participantIcons} ${d.participants.length} agents · ${msgCount} msgs</span>
-              <span>${formatTime(d.updated)}</span>
+              <span>${escapeHtml(participantIcons)} ${Number(d.participants.length)} agents · ${Number(msgCount)} msgs</span>
+              <span>${escapeHtml(formatTime(d.updated))}</span>
             </div>
           </div>
         `;
@@ -3410,11 +3434,11 @@
       return `
         <div class="debate-msg">
           <div class="debate-msg-header">
-            <span class="debate-msg-agent">${msg.agentIcon || '🤖'} ${msg.agentName}</span>
-            <span class="debate-msg-stance ${msg.stance}">${stanceLabels[msg.stance] || msg.stance}</span>
+            <span class="debate-msg-agent">${escapeHtml((msg.agentIcon || '🤖') + ' ' + (msg.agentName || ''))}</span>
+            <span class="debate-msg-stance ${escapeHtml(msg.stance)}">${escapeHtml(stanceLabels[msg.stance] || msg.stance)}</span>
           </div>
           <div class="debate-msg-text">${highlightMentions(msg.text)}</div>
-          <div class="debate-msg-time">${formatTime(msg.timestamp)}</div>
+          <div class="debate-msg-time">${escapeHtml(formatTime(msg.timestamp))}</div>
         </div>
       `;
     }
@@ -3556,7 +3580,8 @@
 
       const meta = document.createElement('div');
       meta.style.cssText = 'font-size:0.7rem;color:var(--text-muted);margin-bottom:3px;display:flex;justify-content:space-between;';
-      meta.innerHTML = `<span>${msg.type === 'outgoing' ? '▶ You' : `${msg.agentIcon || '🤖'} ${msg.agentName || 'Agent'}`}</span><span>${msg.timeStr}</span>`;
+      const who = msg.type === 'outgoing' ? '▶ You' : `${msg.agentIcon || '🤖'} ${msg.agentName || 'Agent'}`;
+      meta.innerHTML = h`<span>${who}</span><span>${msg.timeStr}</span>`;
 
       const content = document.createElement('div');
       content.innerHTML = highlightMentions(msg.text);

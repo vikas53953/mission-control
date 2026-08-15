@@ -15,26 +15,28 @@ const catalyst = require('./sources/catalyst-center');
 const aci = require('./sources/aci');
 const sdwan = require('./sources/sdwan');
 
-const app = express();
-const PORT = 3000;
+// One module owns where the workspace is and how any caller-supplied path is
+// turned into a real path. Nothing else in this file builds a path from input.
+const workspace = require('./workspace');
+const { SQUAD_ROOT, PATHS, safeJoin, isPlainFilename, safeWrite, safeAppend } = workspace;
 
-// Paths to watch
-const SQUAD_ROOT = 'C:\\Users\\vikasmit\\network-squad';
-const PATHS = {
-  agentWorkspace: path.join(SQUAD_ROOT, 'agents'),
-  tasksFile: path.join(SQUAD_ROOT, 'shared', 'TASKS.md'),
-  activityLog: path.join(SQUAD_ROOT, 'shared', 'ACTIVITY_LOG.md'),
-  alertsFile: path.join(SQUAD_ROOT, 'shared', 'ALERTS.md'),
-  reportsFolder: path.join(SQUAD_ROOT, 'agents', 'netops', 'reports'),
-  mentionsLog: path.join(SQUAD_ROOT, 'shared', 'MENTIONS.md')
-};
+const { makeOriginChecker } = require('./origins');
+const { limiter, allowSocketMessage } = require('./ratelimit');
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+// Bind to this machine only unless HOST is set on purpose. Binding to every
+// interface put the dashboard on the office Wi-Fi for anyone to drive.
+const HOST = process.env.HOST || '127.0.0.1';
+
+const origins = makeOriginChecker(PORT);
 
 // All agent IDs
 const AGENT_IDS = ['jarvis', 'netops', 'sentinel', 'firewall-pro', 'loadbal-pro', 'router-expert', 'monitor-eye', 'config-keeper', 'incident-handler', 'doc-writer'];
 
 // Helper: get status file path for any agent
 function getAgentStatusPath(agentId) {
-  return path.join(SQUAD_ROOT, 'agents', agentId, 'STATUS.json');
+  return safeJoin(PATHS.agentWorkspace, path.join(String(agentId), 'STATUS.json'));
 }
 
 // Agent registry
@@ -167,9 +169,29 @@ const clients = new Set();
 let isPaused = false;
 
 // Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
+// Refuse anything from a web page that is not on the allowlist, before it can
+// reach a route. Browsers always send Origin cross-origin, so this is what
+// stops a random site from driving the dashboard.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origins.isAllowed(origin)) {
+    console.warn(`[CORS] Refused origin: ${origin}`);
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+  next();
+});
+app.use(cors({ origin: (origin, cb) => cb(null, origins.isAllowed(origin)) }));
+app.use(express.json({ limit: '256kb' }));
+
+// Rate limits. Generous enough that normal clicking never notices; tight
+// enough that a loop cannot hammer the shared Cisco sandboxes through our
+// credentials. Reads and writes get separate budgets.
+const readLimit = limiter({ name: 'read', max: Number(process.env.RATE_LIMIT_READ || 300) });
+const writeLimit = limiter({ name: 'write', max: Number(process.env.RATE_LIMIT_WRITE || 60) });
+app.use('/api/', readLimit);
+app.use('/api/', (req, res, next) => (req.method === 'GET' ? next() : writeLimit(req, res, next)));
+
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Create HTTP server
 const server = http.createServer(app);
@@ -186,6 +208,21 @@ function broadcast(type, data) {
     }
   });
 }
+
+// Surface a problem on the dashboard instead of dying quietly (or loudly).
+// The detail stays in the server log; the browser gets plain words.
+function reportSystemError(what, err) {
+  const detail = err && err.message ? err.message : String(err || '');
+  console.error(`[System] ${what}: ${detail}`);
+  broadcast('system_error', { message: `${what} — check the server window for detail.` });
+}
+
+// Every failed write in the app lands here.
+workspace.setWriteErrorHandler((label, err) => reportSystemError(`Could not write ${label}`, err));
+
+// A gap anywhere else should be visible, not fatal.
+process.on('unhandledRejection', (err) => reportSystemError('Background job failed', err));
+process.on('uncaughtException', (err) => reportSystemError('Unexpected error', err));
 
 // Hand the live-source layer the plumbing it needs to talk to the dashboard.
 // It stays out of server internals; this is the only seam between them.
@@ -207,16 +244,29 @@ live.init({
   moveTaskOnBoard,
   appendToActivityLog,
   writeReport(agentId, filename, content) {
-    const dir = path.join(SQUAD_ROOT, 'agents', agentId, 'reports');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const full = path.join(dir, filename);
-    fs.writeFileSync(full, content);
+    // Agent-chosen file names can carry user text, so they go through safeJoin
+    // like anything else built from input.
+    const full = safeJoin(PATHS.agentWorkspace, path.join(agentId, 'reports', filename));
+    if (!full) {
+      console.error(`[Workspace] Refused report path for ${agentId}: ${filename}`);
+      return null;
+    }
+    safeWrite(full, content, `report ${filename}`);
     return filename;
   },
 });
 
 // WebSocket connection handler
-wss.on('connection', (ws) => {
+// The Origin check has to happen here too: CORS does not apply to WebSockets,
+// so without it a foreign page could still open a socket and read everything.
+wss.on('connection', (ws, req) => {
+  const origin = req && req.headers ? req.headers.origin : undefined;
+  if (!origins.isAllowed(origin)) {
+    console.warn(`[WS] Refused connection from origin: ${origin}`);
+    ws.close(1008, 'Origin not allowed');
+    return;
+  }
+  const clientKey = (req && (req.socket?.remoteAddress || 'unknown')) || 'unknown';
   clients.add(ws);
   console.log(`[WS] Client connected. Total: ${clients.size}`);
 
@@ -237,12 +287,20 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (message) => {
     try {
+      if (!allowSocketMessage(clientKey)) {
+        ws.send(JSON.stringify({
+          type: 'system_error',
+          data: { message: 'Too many messages — slow down.' },
+          timestamp: new Date().toISOString()
+        }));
+        return;
+      }
       const parsed = JSON.parse(message);
       if (parsed.type === 'command') {
         handleCommand(parsed.data);
       }
     } catch (e) {
-      console.error('[WS] Invalid message:', e);
+      console.error('[WS] Invalid message:', e.message);
     }
   });
 
@@ -536,7 +594,21 @@ function detectAgentIntent(agentId, command) {
 // ── Main agent action dispatcher — live sources, no simulation ───────────────
 // Every network answer below comes from a real Cisco DevNet always-on sandbox
 // via sources/live-agents.js. Agents without a backend say "not connected".
+// One wrapper catches for every call site (several of them are timers, where a
+// throw or a rejected promise would otherwise take the whole server down).
 function simulateAgentAction(agentId, command) {
+  try {
+    const result = runAgentAction(agentId, command);
+    if (result && typeof result.then === 'function') {
+      result.catch((err) => reportSystemError(`${agentId} could not finish that request`, err));
+    }
+    return result;
+  } catch (err) {
+    reportSystemError(`${agentId} could not finish that request`, err);
+  }
+}
+
+function runAgentAction(agentId, command) {
   const agent = agents[agentId];
   if (!agent) return;
 
@@ -1050,11 +1122,7 @@ function updateAgentStatus(agentId, status, lastAction) {
 
     // Save to STATUS.json
     const statusPath = getAgentStatusPath(agentId);
-    try {
-      fs.writeFileSync(statusPath, JSON.stringify(agents[agentId], null, 2));
-    } catch (e) {
-      console.error(`[Status] Error saving ${agentId} status:`, e.message);
-    }
+    if (statusPath) safeWrite(statusPath, JSON.stringify(agents[agentId], null, 2), `${agentId} status`);
 
     broadcast('agent_status', agents[agentId]);
   }
@@ -1062,12 +1130,7 @@ function updateAgentStatus(agentId, status, lastAction) {
 
 // Append to activity log
 function appendToActivityLog(entry) {
-  try {
-    fs.appendFileSync(PATHS.activityLog, entry);
-  } catch (e) {
-    // File might not exist, create it
-    fs.writeFileSync(PATHS.activityLog, entry);
-  }
+  safeAppend(PATHS.activityLog, entry, 'activity log');
 }
 
 // Get tasks from TASKS.md
@@ -1218,6 +1281,7 @@ function getRecentActivity() {
 // Load agent status from file
 function loadAgentStatus(agentId) {
   const statusPath = getAgentStatusPath(agentId);
+  if (!statusPath) return;
   try {
     if (fs.existsSync(statusPath)) {
       const data = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
@@ -1571,10 +1635,13 @@ app.post('/api/tasks', (req, res) => {
   try {
     const tasks = req.body;
     const content = generateTasksMarkdown(tasks);
-    fs.writeFileSync(PATHS.tasksFile, content);
+    if (!safeWrite(PATHS.tasksFile, content, 'task board')) {
+      return res.status(500).json({ error: 'Could not save the task board' });
+    }
     res.json({ success: true });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('[Tasks] Save failed:', e.message);
+    res.status(500).json({ error: 'Could not save the task board' });
   }
 });
 
@@ -1627,9 +1694,10 @@ function addTaskToBoard(column, task) {
 
   tasks[column].push(newTask);
 
-  // Save to file
+  // Save to file. A failed write reports itself to the dashboard instead of
+  // throwing — this runs inside timers where a throw would kill the process.
   const content = generateTasksMarkdown(tasks);
-  fs.writeFileSync(PATHS.tasksFile, content);
+  if (!safeWrite(PATHS.tasksFile, content, 'task board')) return null;
 
   // Broadcast update
   broadcast('tasks_updated', tasks);
@@ -1663,9 +1731,9 @@ function moveTaskOnBoard(taskTitle, fromColumn, toColumn) {
   }
   tasks[toColumn].push(task);
 
-  // Save to file
+  // Save to file (never throws — see addTaskToBoard)
   const content = generateTasksMarkdown(tasks);
-  fs.writeFileSync(PATHS.tasksFile, content);
+  if (!safeWrite(PATHS.tasksFile, content, 'task board')) return false;
 
   // Broadcast update
   broadcast('tasks_updated', tasks);
@@ -1694,14 +1762,19 @@ function moveTaskOnBoard(taskTitle, fromColumn, toColumn) {
 
     // Auto-remove from done after 4 seconds so board stays clean
     setTimeout(() => {
-      const latest = getTasks();
-      const doneIdx = (latest.done || []).findIndex(t => t.title === taskTitle);
-      if (doneIdx !== -1) {
-        latest.done.splice(doneIdx, 1);
-        const updated = generateTasksMarkdown(latest);
-        fs.writeFileSync(PATHS.tasksFile, updated);
-        broadcast('tasks_updated', latest);
-        console.log(`[Tasks] Auto-removed completed task from board: ${taskTitle}`);
+      try {
+        const latest = getTasks();
+        const doneIdx = (latest.done || []).findIndex(t => t.title === taskTitle);
+        if (doneIdx !== -1) {
+          latest.done.splice(doneIdx, 1);
+          const updated = generateTasksMarkdown(latest);
+          if (!safeWrite(PATHS.tasksFile, updated, 'task board')) return;
+          broadcast('tasks_updated', latest);
+          console.log(`[Tasks] Auto-removed completed task from board: ${taskTitle}`);
+        }
+      } catch (e) {
+        // Nothing can catch a throw from inside a timer — handle it here.
+        reportSystemError('Could not tidy the task board', e);
       }
     }, 4000);
   }
@@ -1797,15 +1870,21 @@ app.post('/api/command', (req, res) => {
 // File download endpoint
 app.get('/api/files/download/:filename', (req, res) => {
   const filename = req.params.filename;
-  // Search across all agent directories for the file
+
+  // This route takes a file NAME, never a path. Express decodes %2f into a
+  // slash only after the route matched, which is how `..%2f..%2f` used to walk
+  // straight out of the workspace — so the name is rejected outright first.
+  if (!isPlainFilename(filename)) {
+    return res.status(400).json({ error: 'Bad filename' });
+  }
+
   for (const agentId of AGENT_IDS) {
-    const agentDir = path.join(SQUAD_ROOT, 'agents', agentId);
-    // Check agent root
-    let filePath = path.join(agentDir, filename);
-    if (fs.existsSync(filePath)) return res.download(filePath);
-    // Check reports subfolder
-    filePath = path.join(agentDir, 'reports', filename);
-    if (fs.existsSync(filePath)) return res.download(filePath);
+    for (const rel of [path.join(agentId, filename), path.join(agentId, 'reports', filename)]) {
+      const filePath = safeJoin(PATHS.agentWorkspace, rel);
+      if (filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        return res.download(filePath);
+      }
+    }
   }
   res.status(404).json({ error: 'File not found' });
 });
@@ -1814,9 +1893,10 @@ app.get('/api/files/download/:filename', (req, res) => {
 app.get('/api/browse', (req, res) => {
   const requestedPath = req.query.path || SQUAD_ROOT;
 
-  // Security: Ensure path is within squad workspace
-  const normalizedPath = path.normalize(requestedPath);
-  if (!normalizedPath.startsWith(SQUAD_ROOT)) {
+  // One guard, one helper — resolves the path and proves it is inside the
+  // workspace (a sibling folder called "squad-secret" no longer sneaks past).
+  const normalizedPath = safeJoin(SQUAD_ROOT, String(requestedPath));
+  if (!normalizedPath) {
     return res.status(403).json({ error: 'Access denied - path outside workspace' });
   }
 
@@ -1888,7 +1968,10 @@ app.get('/api/browse', (req, res) => {
       root: SQUAD_ROOT
     });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    // Node's own error text carries absolute paths and hostnames — keep it in
+    // the server log, hand the browser plain words.
+    console.error('[Browse] Failed:', e.message);
+    res.status(500).json({ error: 'Could not read that folder' });
   }
 });
 
@@ -1900,8 +1983,8 @@ app.get('/api/browse/download', (req, res) => {
     return res.status(400).json({ error: 'Path required' });
   }
 
-  const normalizedPath = path.normalize(requestedPath);
-  if (!normalizedPath.startsWith(SQUAD_ROOT)) {
+  const normalizedPath = safeJoin(SQUAD_ROOT, String(requestedPath));
+  if (!normalizedPath) {
     return res.status(403).json({ error: 'Access denied' });
   }
 
@@ -2026,13 +2109,26 @@ function initActivityTracker() {
 }
 
 // Start server
-server.listen(PORT, () => {
+// Make sure the workspace exists before anything tries to write into it, so a
+// fresh clone boots and works instead of crashing on the first command.
+try {
+  const created = workspace.ensureWorkspace(AGENT_IDS);
+  if (created.length) console.log(`[Workspace] Created ${created.length} missing folders/files under ${SQUAD_ROOT}`);
+} catch (e) {
+  console.error(`[Workspace] Could not prepare ${SQUAD_ROOT}: ${e.message}`);
+  console.error('[Workspace] Set SQUAD_ROOT to a folder this account can write to.');
+  process.exit(1);
+}
+
+server.listen(PORT, HOST, () => {
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════════╗');
   console.log('║       🚀 MISSION CONTROL DASHBOARD - LIVE SERVER 🚀       ║');
   console.log('╠═══════════════════════════════════════════════════════════╣');
-  console.log(`║  Dashboard: http://localhost:${PORT}                          ║`);
-  console.log(`║  WebSocket: ws://localhost:${PORT}                            ║`);
+  console.log(`║  Dashboard: http://${HOST}:${PORT}`);
+  console.log(`║  WebSocket: ws://${HOST}:${PORT}`);
+  console.log(`║  Workspace: ${SQUAD_ROOT}`);
+  console.log(`║  Allowed origins: ${origins.allowed.join(', ')}`);
   console.log('╠═══════════════════════════════════════════════════════════╣');
   console.log('║  Status: LIVE                                             ║');
   console.log('║  File Watcher: ACTIVE                                     ║');
