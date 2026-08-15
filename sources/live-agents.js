@@ -12,7 +12,7 @@
 const catalyst = require('./catalyst-center');
 const aci = require('./aci');
 const sdwan = require('./sdwan');
-const { checkCommand, checkIntent, READ_VERBS } = require('./guardrails');
+const { checkCommand, checkIntent, commandWord, READ_VERBS } = require('./guardrails');
 
 // The host app injects its broadcast/status/task-board plumbing here so this
 // module stays free of server internals.
@@ -696,44 +696,74 @@ function hasLiveBackend(agentId) { return Boolean(HANDLERS[agentId]); }
 //
 // So the question is asked FIRST: is this request one this agent can answer?
 // If not, the agent says so and runs nothing. There is no default action.
+//
+// A capability is TWO questions, not one keyword sweep: what is being asked FOR
+// (the subject) and what is being asked to be DONE (the verb). Testing keyword
+// presence alone let an in-domain noun drag an out-of-domain request through —
+// "document my holiday in Spain" wrote a real network inventory file, "backup
+// the inventory" ran a live device read, "is the coffee machine up?" answered
+// with a switch health score. Both halves must land inside the agent's remit.
+//
+//   subjects — the things this agent can actually see. Nouns only.
+//   verbs    — the actions it can actually perform, on top of the shared
+//              question/read openers below. Anything else is out of remit.
+//
+// Verbs people use to ASK for a reading. Every agent accepts these, because
+// every agent's job is to read something and report it back.
+const READ_ASK = [
+  'what', 'whats', 'which', 'who', 'whose', 'when', 'where', 'why', 'how',
+  'is', 'are', 'was', 'were', 'am', 'any', 'anything', 'anyone', 'does', 'did',
+  'has', 'have', 'tell', 'give', 'show', 'list', 'get', 'check', 'read',
+  'report', 'look', 'see', 'display', 'find', 'confirm', 'verify', 'compare',
+  'pull', 'fetch', 'run', 'status', 'update', 'brief', 'catch', 'recap',
+];
+
 const CAPABILITIES = {
   'netops': {
-    match: /\b(device|devices|switch|switches|inventory|reachab|reachable|health|campus|catalyst|dnac|precheck|pre-check|connectivity|ssh|online|offline|up|down|platform|software|version|uptime|hostname|serial|ip|node|nodes|kit|gear|status)\b/i,
+    subjects: /\b(device|devices|switch|switches|inventory|reachab|reachable|campus|catalyst|dnac|precheck|pre-check|connectivity|ssh|platform|software|version|uptime|hostname|serial|network|health score|kit|gear|sw\d+)\b/i,
+    verbs: [],
     can: [
       'read the campus inventory from Catalyst Center — hostname, management IP, platform, software version, reachability',
       'report the campus health score (how many devices are good vs bad)',
     ],
   },
   'monitor-eye': {
-    match: /\b(alert|alerts|alarm|alarms|monitor|monitoring|threshold|issue|issues|health|event|events|syslog|snmp|metric|metrics|dashboard|active|cleared|noisy|noise|quiet|watch)\b/i,
+    subjects: /\b(alert|alerts|alarm|alarms|threshold|issue|issues|event|events|syslog|snmp|metric|metrics|health|network|catalyst|sd-?wan|vmanage|device|devices)\b/i,
+    verbs: ['monitor', 'watch', 'sweep', 'poll'],
     can: [
       'read live alerts and open issues from Catalyst Center',
       'read active and cleared alarm counts from SD-WAN vManage',
     ],
   },
   'incident-handler': {
-    match: /\b(incident|incidents|fault|faults|issue|issues|outage|rca|root[\s-]?cause|troubleshoot|diagnose|impact|open|critical|major|severity|down|broken|problem|problems|triage|escalat)\b/i,
+    subjects: /\b(incident|incidents|fault|faults|issue|issues|outage|rca|root[\s-]?cause|impact|severity|critical|major|problem|problems|network|fabric|aci|catalyst|device|devices)\b/i,
+    verbs: ['triage', 'diagnose', 'troubleshoot', 'investigate'],
     can: [
       'read open issues from Catalyst Center',
       'read critical faults from the ACI fabric (when the APIC is reachable)',
     ],
   },
   'doc-writer': {
-    match: /\b(doc|docs|document|documentation|write|write[\s-]?up|report|inventory|markdown|md|record|notes|topology|list|summary|as[\s-]?built)\b/i,
+    // Note what is NOT here: "document", "write", "report" are verbs, not
+    // subjects. Doc-Writer writes about the network it can read — nothing else.
+    subjects: /\b(network|inventory|device|devices|switch|switches|router|routers|fabric|aci|sd-?wan|overlay|topology|incident|incidents|alarm|alarms|alert|alerts|config|configuration|source|sources|catalyst|as[\s-]?built|estate)\b/i,
+    verbs: ['write', 'document', 'draft', 'produce', 'generate', 'compile', 'record', 'summarise', 'summarize', 'note'],
     can: [
       'write a network inventory document from live sources (Catalyst Center, ACI, SD-WAN) and save it as markdown',
       'log any source it could not reach inside that document, rather than hiding it',
     ],
   },
   'router-expert': {
-    match: /\b(aci|apic|fabric|leaf|leaves|spine|spines|tenant|tenants|epg|bd\b|vrf|contract|nexus|sd-?wan|vmanage|overlay|vedge|vedges|controller|controllers|wan|router|routers|routing|bgp|ospf|alarm|alarms|data[\s-]?cent(er|re))\b/i,
+    subjects: /\b(aci|apic|fabric|leaf|leaves|spine|spines|tenant|tenants|epg|bd\b|vrf|contract|nexus|sd-?wan|vmanage|overlay|vedge|vedges|controller|controllers|wan|router|routers|routing|bgp|ospf|alarm|alarms|data[\s-]?cent(er|re))\b/i,
+    verbs: ['audit', 'walk', 'trace'],
     can: [
       'read the ACI fabric from the APIC — nodes, fabric health, tenants, faults, and a tenant VRF/BD/EPG/contract walk',
       'read the SD-WAN overlay from vManage — devices, controllers, vEdges and alarm counts',
     ],
   },
   'jarvis': {
-    match: /\b(network|overview|everything|all sources|devices?|inventory|fabric|switch(es)?|router|wan|sd-?wan|aci|health|reachab|picture|state)\b/i,
+    subjects: /\b(network|overview|picture|estate|all sources|every source|devices?|inventory|fabric|switch(es)?|router|wan|sd-?wan|aci|catalyst|reachab|health)\b/i,
+    verbs: ['poll', 'overview', 'summarise', 'summarize', 'brief'],
     can: [
       'poll every connected source at once (Catalyst Center, ACI, SD-WAN) and give one honest cross-network picture',
       'name which sources are not connected, instead of filling the gap with a guess',
@@ -742,12 +772,23 @@ const CAPABILITIES = {
 };
 
 // Honest dead end: this agent has no way to answer, so it answers nothing.
-function cannotAnswer(agentId, command) {
+// `why` says which half of the capability missed, so the reply tells the user
+// something useful instead of a flat "no".
+function cannotAnswer(agentId, command, why) {
   const cap = CAPABILITIES[agentId];
   const can = cap ? cap.can : [];
+  let because = '';
+  if (why && !why.subjectOk) {
+    because = `That is not something I can see. I only read the sources listed below — ` +
+      `if it is not on one of them, I have no way to know anything about it.\n\n`;
+  } else if (why && !why.verbOk) {
+    because = `I read and report. I do not "${why.verb}" anything — nothing in this squad ` +
+      `changes, stores or creates state on a device.\n\n`;
+  }
   say(agentId,
     `🤷 I don't have a way to answer that.\n${RULE}\n` +
     `You asked: "${String(command || '').slice(0, 140)}"\n\n` +
+    because +
     `I have run nothing. I will not answer a different question than the one you asked, ` +
     `and I will not dress up a reading you did not ask for as the answer.\n\n` +
     (can.length ? `Here is what I can actually do:\n${can.map((c) => `• ${c}`).join('\n')}\n\n` : '') +
@@ -759,10 +800,30 @@ function cannotAnswer(agentId, command) {
 
 // Can this agent answer this request at all? Config-Keeper has its own, finer
 // gate (readCommandFrom), so it is not listed here.
+//
+// BOTH halves must land: the subject asked about has to be something this agent
+// can see, AND the action asked for has to be something it can do. Either one
+// alone is not a capability — "backup the inventory" is an in-remit noun with an
+// out-of-remit verb, and answering it with a device read would be exactly the
+// substitution this whole branch exists to stop.
 function canAnswer(agentId, command) {
   const cap = CAPABILITIES[agentId];
-  if (!cap) return true;
-  return cap.match.test(String(command || ''));
+  if (!cap) return { ok: true };
+  const text = String(command || '');
+
+  const subjectOk = cap.subjects.test(text);
+
+  // The verb is the first real word of the request, filler stripped — the same
+  // reading the guardrail uses to spot a destructive command.
+  const verb = commandWord(text);
+  const verbOk = !verb
+    || READ_ASK.includes(verb)
+    || cap.verbs.includes(verb)
+    // A request that opens with its own subject ("device health?", "alarms?")
+    // is a noun phrase, not a different action.
+    || cap.subjects.test(verb);
+
+  return { ok: subjectOk && verbOk, subjectOk, verbOk, verb };
 }
 
 // Entry point used by the dispatcher in server.js.
@@ -771,8 +832,9 @@ function handle(agentId, command) {
   const fn = HANDLERS[agentId];
   if (!fn) return notConnected(agentId);
   // Config-Keeper gates itself: it must find a real read command in the text.
-  if (agentId !== 'config-keeper' && !canAnswer(agentId, command)) {
-    return cannotAnswer(agentId, command);
+  if (agentId !== 'config-keeper') {
+    const verdict = canAnswer(agentId, command);
+    if (!verdict.ok) return cannotAnswer(agentId, command, verdict);
   }
   return fn(agentId, command);
 }

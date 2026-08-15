@@ -140,4 +140,4 @@ function assertReadOnly(command) {
   return verdict.command;
 }
 
-module.exports = { checkCommand, checkIntent, assertReadOnly, READ_VERBS, STATE_CHANGING };
+module.exports = { checkCommand, checkIntent, assertReadOnly, commandWord, READ_VERBS, STATE_CHANGING };
