@@ -13,12 +13,13 @@ looking report.
 
 ## Screenshot
 
-_Coming soon._
+![Mission Control dashboard](docs/screenshot.png)
 
-<!-- TODO: save a screenshot of the dashboard at localhost:3000 to docs/screenshot.png,
-     then replace the line above with:
-     ![Mission Control dashboard](docs/screenshot.png)
-     Keep it commented out until the file exists — GitHub renders a broken image otherwise. -->
+A real session, not a mock-up. In the chat panel NetOps has just read the live
+device inventory out of the Catalyst Center sandbox — four switches, their
+management IPs, platform and IOS-XE version, all reachable. In the squad list on
+the left, Sentinel and Firewall-Pro say "not connected — no data source" because
+nothing is wired behind them, which is exactly what they are supposed to say.
 
 ## Quick start
 
