@@ -753,7 +753,8 @@ function showAgentHelp(agentId) {
       `I will not invent a report. Add the credentials to .env.local and I will answer for real.`
     : live.hasLiveBackend(agentId)
       ? `🔍 **Reads I can do (live, read-only)**\n` +
-        `• Ask me in plain English — I answer from a real Cisco DevNet sandbox.\n` +
+        ((live.CAPABILITIES[agentId]?.can || []).map((c) => `• ${c}\n`).join('')) +
+        `• Anything outside that list I will say I cannot answer — I never run a different read instead.\n` +
         `• show / ping / traceroute / dir / more — the only verbs allowed through to a device.\n\n` +
         `🚫 **What I will refuse**\n` +
         `Anything that changes a device: configure, write, reload, erase, shut/no shut, copy, delete.\n` +
@@ -894,30 +895,32 @@ function extractJarvisSubject(input) {
 }
 
 // When intent is genuinely unclear, Jarvis reasons through it and acts
+// Jarvis's dead end. It used to "Roger that" anything it did not understand and
+// then triage it into a real task assigned to a real agent — which sent live
+// device reads off the back of a request nobody could answer. A request Jarvis
+// cannot place is now said out loud, and no work is created.
 function simulateJarvisGeneralResponse(agentId, command) {
   const jarvis = agents[agentId];
-  const subject = extractJarvisSubject(command);
-
-  // Jarvis acknowledges in natural language, then decides what to do
-  const acknowledgements = [
-    `Got it — let me figure out the best way to handle: "${subject}"`,
-    `Understood. Analyzing: "${subject}" — routing to the right agent now.`,
-    `On it. I'll triage "${subject}" to the most relevant squad member.`,
-    `Roger that. Processing: "${subject}"`
-  ];
-  const ack = acknowledgements[Math.floor(Math.random() * acknowledgements.length)];
 
   setTimeout(() => {
     broadcast('chat_message', {
       type: 'incoming', agent: agentId, agentName: jarvis.name, agentIcon: jarvis.icon,
-      text: `🎖️ ${ack}`,
+      text:
+        `🤷 I don't have a way to answer that.\n──────────────────────────────────\n` +
+        `You asked: "${String(command).slice(0, 140)}"\n\n` +
+        `I have created no task and sent nothing to any device. This squad only knows the ` +
+        `network it is wired to — Cisco Catalyst Center, the ACI fabric and the SD-WAN overlay.\n\n` +
+        `Here is what I can actually do:\n` +
+        `• One live picture across every connected source — ask "network overview"\n` +
+        `• Squad standup, roll call and status\n` +
+        `• Triage a piece of network work to an agent — say "triage <the work>"\n` +
+        `• Escalate something to Vikas — say "escalate <the issue>"\n\n` +
+        `Or @mention an agent directly — type "help" for the full list.`,
       timestamp: new Date().toISOString()
     });
-    appendToActivityLog(`[${new Date().toISOString()}] [Jarvis] Processing general request: "${subject}"\n`);
+    appendToActivityLog(`[${new Date().toISOString()}] [Jarvis] No way to answer — ran nothing: "${String(command).slice(0, 60)}"\n`);
+    updateAgentStatus(agentId, 'idle', 'No way to answer that — ran nothing');
   }, 300);
-
-  // Then triage it to the best-fit agent
-  setTimeout(() => simulateTriage(agentId, subject), 1800);
 }
 
 // Main Jarvis entry point — intent-driven, no fixed commands

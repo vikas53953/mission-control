@@ -687,15 +687,98 @@ const HANDLERS = {
 
 function hasLiveBackend(agentId) { return Boolean(HANDLERS[agentId]); }
 
+// ── What each agent can ACTUALLY answer ─────────────────────────────────────
+// Every agent below has exactly one live action, and it reads one set of
+// sources. Before this map existed the intent router fell through to that
+// action for ANY text, so "what is the weather in Paris today" and "wipe the
+// config on sw1" both came back as a confident live device read — the same
+// silent substitution that Config-Keeper used to do with "show version".
+//
+// So the question is asked FIRST: is this request one this agent can answer?
+// If not, the agent says so and runs nothing. There is no default action.
+const CAPABILITIES = {
+  'netops': {
+    match: /\b(device|devices|switch|switches|inventory|reachab|reachable|health|campus|catalyst|dnac|precheck|pre-check|connectivity|ssh|online|offline|up|down|platform|software|version|uptime|hostname|serial|ip|node|nodes|kit|gear|status)\b/i,
+    can: [
+      'read the campus inventory from Catalyst Center — hostname, management IP, platform, software version, reachability',
+      'report the campus health score (how many devices are good vs bad)',
+    ],
+  },
+  'monitor-eye': {
+    match: /\b(alert|alerts|alarm|alarms|monitor|monitoring|threshold|issue|issues|health|event|events|syslog|snmp|metric|metrics|dashboard|active|cleared|noisy|noise|quiet|watch)\b/i,
+    can: [
+      'read live alerts and open issues from Catalyst Center',
+      'read active and cleared alarm counts from SD-WAN vManage',
+    ],
+  },
+  'incident-handler': {
+    match: /\b(incident|incidents|fault|faults|issue|issues|outage|rca|root[\s-]?cause|troubleshoot|diagnose|impact|open|critical|major|severity|down|broken|problem|problems|triage|escalat)\b/i,
+    can: [
+      'read open issues from Catalyst Center',
+      'read critical faults from the ACI fabric (when the APIC is reachable)',
+    ],
+  },
+  'doc-writer': {
+    match: /\b(doc|docs|document|documentation|write|write[\s-]?up|report|inventory|markdown|md|record|notes|topology|list|summary|as[\s-]?built)\b/i,
+    can: [
+      'write a network inventory document from live sources (Catalyst Center, ACI, SD-WAN) and save it as markdown',
+      'log any source it could not reach inside that document, rather than hiding it',
+    ],
+  },
+  'router-expert': {
+    match: /\b(aci|apic|fabric|leaf|leaves|spine|spines|tenant|tenants|epg|bd\b|vrf|contract|nexus|sd-?wan|vmanage|overlay|vedge|vedges|controller|controllers|wan|router|routers|routing|bgp|ospf|alarm|alarms|data[\s-]?cent(er|re))\b/i,
+    can: [
+      'read the ACI fabric from the APIC — nodes, fabric health, tenants, faults, and a tenant VRF/BD/EPG/contract walk',
+      'read the SD-WAN overlay from vManage — devices, controllers, vEdges and alarm counts',
+    ],
+  },
+  'jarvis': {
+    match: /\b(network|overview|everything|all sources|devices?|inventory|fabric|switch(es)?|router|wan|sd-?wan|aci|health|reachab|picture|state)\b/i,
+    can: [
+      'poll every connected source at once (Catalyst Center, ACI, SD-WAN) and give one honest cross-network picture',
+      'name which sources are not connected, instead of filling the gap with a guess',
+    ],
+  },
+};
+
+// Honest dead end: this agent has no way to answer, so it answers nothing.
+function cannotAnswer(agentId, command) {
+  const cap = CAPABILITIES[agentId];
+  const can = cap ? cap.can : [];
+  say(agentId,
+    `🤷 I don't have a way to answer that.\n${RULE}\n` +
+    `You asked: "${String(command || '').slice(0, 140)}"\n\n` +
+    `I have run nothing. I will not answer a different question than the one you asked, ` +
+    `and I will not dress up a reading you did not ask for as the answer.\n\n` +
+    (can.length ? `Here is what I can actually do:\n${can.map((c) => `• ${c}`).join('\n')}\n\n` : '') +
+    `If this belongs to another agent, @mention them — or type "help" to see my full remit.`);
+  ctx.appendToActivityLog(
+    `[${new Date().toISOString()}] [${ctx.agents[agentId]?.name || agentId}] No way to answer — ran nothing: "${String(command || '').slice(0, 60)}"\n`);
+  ctx.updateAgentStatus(agentId, 'idle', 'No way to answer that — ran nothing');
+}
+
+// Can this agent answer this request at all? Config-Keeper has its own, finer
+// gate (readCommandFrom), so it is not listed here.
+function canAnswer(agentId, command) {
+  const cap = CAPABILITIES[agentId];
+  if (!cap) return true;
+  return cap.match.test(String(command || ''));
+}
+
 // Entry point used by the dispatcher in server.js.
 function handle(agentId, command) {
   if (NO_BACKEND[agentId]) return notConnected(agentId);
   const fn = HANDLERS[agentId];
   if (!fn) return notConnected(agentId);
+  // Config-Keeper gates itself: it must find a real read command in the text.
+  if (agentId !== 'config-keeper' && !canAnswer(agentId, command)) {
+    return cannotAnswer(agentId, command);
+  }
   return fn(agentId, command);
 }
 
 module.exports = {
   init, handle, refuseWrite, notConnected, hasLiveBackend, NO_BACKEND, readCommandFrom,
+  canAnswer, cannotAnswer, CAPABILITIES,
   debateContribution,
 };

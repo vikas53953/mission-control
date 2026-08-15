@@ -33,7 +33,17 @@ const STATE_CHANGING = [
   'shut', 'shutdown', 'reset', 'debug', 'undebug', 'install', 'request',
   'boot', 'format', 'rename', 'rollback', 'commit', 'enable', 'disable',
   'upgrade', 'downgrade', 'provision', 'deploy', 'push', 'apply', 'archive',
+  // Plain-English ways people ask for the same destruction.
+  'wipe', 'nuke', 'destroy', 'overwrite', 'flush', 'factory', 'purge', 'kill',
 ];
+
+// Verbs on the list above that are ALSO ordinary English. They mean "change the
+// device" only when what follows is device-shaped; followed by any of these
+// words they are authoring, not configuring, and must not be refused.
+// ("write me a report" is a Doc-Writer job; "write erase" is not.)
+const SOFT_VERBS = {
+  write: /^(a|an|me|us|up|out|report|reports|doc|docs|document|documentation|summary|notes|note|file|markdown|md|inventory|down)\b/i,
+};
 
 // Words people put in front of the real verb. Stripped before we decide what
 // the command intent actually is, so "please erase startup-config" is caught.
@@ -109,6 +119,13 @@ function checkIntent(text) {
     // Cisco "no <command>" — "no, show me the version" must not be refused.
     // "no shut" still has a second word, so it is still judged a change.
     if (word === 'no' && /^no\W*$/i.test(clause.trim())) continue;
+    // Ordinary-English use of a verb that is only destructive on a device.
+    if (SOFT_VERBS[word]) {
+      const rest = String(clause).toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ')
+        .split(/\s+/).filter(Boolean);
+      const after = rest.slice(rest.indexOf(word) + 1).join(' ');
+      if (SOFT_VERBS[word].test(after)) continue;
+    }
     if (STATE_CHANGING.includes(word)) {
       return { destructive: true, keyword: word, clause: clause.trim() };
     }
