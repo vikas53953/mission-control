@@ -7,6 +7,11 @@ const https = require('https');
 const DEFAULT_TIMEOUT = 30000;
 
 function request(opts, body) {
+  // DELIBERATE: certificate checking is ON by default and only relaxed when a
+  // caller passes verifyTls: false. The Cisco DevNet always-on sandboxes serve
+  // self-signed certificates, so the sandbox adapters set that flag on purpose.
+  // Never set it for a customer's real kit — the credentials would cross the
+  // wire unverified.
   const agent = new https.Agent({ rejectUnauthorized: opts.verifyTls !== false, keepAlive: true });
 
   return new Promise((resolve) => {
