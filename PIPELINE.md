@@ -221,3 +221,13 @@ C evidence console: https://claude.ai/code/artifact/4b01ea82-8009-4c78-b083-f678
 Pick page (recommendation: C, A's takeover addable later as P1 mode):
 https://claude.ai/code/artifact/5ffa5dc5-4b3a-4ada-b979-036ff5636456
 Awaiting Vikas's pick. Stage 7 QA done (1 blocker 4 major → fix/qa-honesty in flight).
+
+### QA honesty PR #5 — MERGED 2026-08-15 (533d07a)
+Stage 7 QA (1 blocker + 4 major) fixed over 3 review rounds, all class-level:
+- Config-Keeper silent substitution → every agent refuses out loud, names what it refused.
+- No agent falls through to a default live action; unrecognised request → "ran nothing" + capability list.
+- Capability = verb AND subject (not keyword); Jarvis fallback creates no task; guardrail
+  false positives fixed (config as noun ok); pause real + zero console errors; replies
+  quote their originating question; unknown @mention makes no task; consensus bar = readings vs no-data.
+Known nit: "@Incident-Handler triage my landlord problem" matches (dictionary overlap on
+problem/triage) — to be handled in the triage feature build. Stage 7 = done.
