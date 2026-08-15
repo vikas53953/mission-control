@@ -419,11 +419,15 @@ function generateMentionResponse(responderId, fromId, message) {
   const from = agents[fromId];
   const msg = message.toLowerCase();
 
+  // An acknowledgement may only promise what the agent can actually do, which
+  // is read its own live source (Catalyst Center, the ACI fabric, or vManage).
+  // Never name a tool, feed or capability that does not exist here — a
+  // fabricated capability is as dishonest as a fabricated reading.
   const responses = {
     'netops': [
-      `@${from.name} Roger that! Running network checks now...`,
-      `@${from.name} On it — initiating device connectivity tests.`,
-      `@${from.name} Acknowledged. Pulling latest device metrics.`
+      `@${from.name} Roger that — reading live device inventory from Catalyst Center.`,
+      `@${from.name} On it — checking current device reachability on Catalyst Center.`,
+      `@${from.name} Acknowledged. Pulling the live device list and health score.`
     ],
     // No backend wired up — say so rather than promise a report we cannot make.
     'sentinel': [
@@ -439,24 +443,26 @@ function generateMentionResponse(responderId, fromId, message) {
       `@${from.name} On it — querying the live ACI fabric / SD-WAN overlay.`
     ],
     'monitor-eye': [
-      `@${from.name} Checking Splunk dashboards and SNMP alerts.`,
-      `@${from.name} On it — reviewing alert thresholds and baselines.`,
-      `@${from.name} Acknowledged. Pulling monitoring data.`
+      `@${from.name} On it — reading the live health score and open issues from Catalyst Center.`,
+      `@${from.name} Acknowledged. Checking current health and SD-WAN alarm counts.`,
+      `@${from.name} Roger — pulling what my live sources report right now.`
     ],
+    // No backup store, no compliance baseline and no config-diff engine exists —
+    // this agent can only read running software versions and reachability.
     'config-keeper': [
-      `@${from.name} Running config diff and compliance check.`,
-      `@${from.name} Acknowledged. Checking for config drift.`,
-      `@${from.name} On it — pulling latest backup snapshots.`
+      `@${from.name} On it — reading the running software versions from Catalyst Center.`,
+      `@${from.name} Acknowledged. Checking what versions the devices actually report.`,
+      `@${from.name} Roger — I hold no backups or baselines, but I can read current state.`
     ],
     'incident-handler': [
-      `@${from.name} Standing by for incident triage and RCA.`,
-      `@${from.name} Acknowledged. Preparing incident timeline.`,
-      `@${from.name} On it — documenting the issue.`
+      `@${from.name} On it — reading open issues from Catalyst Center and faults from the ACI fabric.`,
+      `@${from.name} Acknowledged. Checking what is currently open on my live sources.`,
+      `@${from.name} Roger — pulling the current issue and fault list.`
     ],
     'doc-writer': [
-      `@${from.name} I'll draft the documentation for this.`,
-      `@${from.name} Acknowledged. Preparing runbook entry.`,
-      `@${from.name} On it — updating the knowledge base.`
+      `@${from.name} On it — reading the connected sandboxes so anything I write is backed by live data.`,
+      `@${from.name} Acknowledged. Checking what the live sources can actually confirm.`,
+      `@${from.name} Roger — gathering current readings from the connected sources.`
     ],
     'jarvis': [
       `@${from.name} Understood. I'll coordinate the team on this.`,
