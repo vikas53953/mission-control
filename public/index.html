@@ -1446,6 +1446,18 @@
       color: var(--accent);
     }
 
+    /* Live reading from a real source */
+    .debate-msg-stance.evidence {
+      background: rgba(16, 185, 129, 0.2);
+      color: var(--success);
+    }
+
+    /* Agent has no source, or its source could not be reached */
+    .debate-msg-stance.no-data {
+      background: rgba(148, 163, 184, 0.2);
+      color: var(--text-secondary);
+    }
+
     .debate-msg-text {
       font-size: 0.8rem;
       color: var(--text-secondary);
@@ -1473,8 +1485,10 @@
       background: var(--success);
     }
 
+    /* "no data" / refute share — deliberately neutral, not alarm red:
+       an agent with no source is not opposition, it is an absence of evidence */
     .consensus-refute {
-      background: var(--danger);
+      background: var(--text-secondary);
     }
 
     .consensus-alt {
@@ -3388,7 +3402,9 @@
         refute: '🔴 REFUTE',
         alternative: '🟡 ALTERNATIVE',
         propose: '💡 PROPOSE',
-        summary: '📊 SUMMARY'
+        summary: '📊 SUMMARY',
+        evidence: '📡 LIVE DATA',
+        'no-data': '🔌 NO DATA'
       };
 
       return `
@@ -3413,9 +3429,12 @@
       const debate = debates.find(d => d.id === debateId);
       if (!debate) return;
 
-      const agrees = debate.messages.filter(m => m.stance === 'agree').length;
-      const refutes = debate.messages.filter(m => m.stance === 'refute').length;
-      const alts = debate.messages.filter(m => m.stance === 'alternative').length;
+      // Green = agents that brought live readings, grey = agents with no data,
+      // amber = alternatives typed in by a person.
+      const count = s => debate.messages.filter(m => m.stance === s).length;
+      const agrees = count('evidence') + count('agree');
+      const refutes = count('no-data') + count('refute');
+      const alts = count('alternative');
       const total = agrees + refutes + alts;
 
       if (total === 0) return;
