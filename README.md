@@ -13,8 +13,12 @@ looking report.
 
 ## Screenshot
 
-<!-- Replace with a real screenshot of the dashboard at localhost:3000 -->
-![Mission Control dashboard](docs/screenshot.png)
+_Coming soon._
+
+<!-- TODO: save a screenshot of the dashboard at localhost:3000 to docs/screenshot.png,
+     then replace the line above with:
+     ![Mission Control dashboard](docs/screenshot.png)
+     Keep it commented out until the file exists — GitHub renders a broken image otherwise. -->
 
 ## Quick start
 
