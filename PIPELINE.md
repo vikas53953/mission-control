@@ -179,3 +179,13 @@ Deviations: see implementation-notes.md (to be created at build stage)
 - Tier-1 security fix agent in flight on `fix/tier1-security` (class fixes: safeJoin,
   escape-at-every-sink, origin allowlist, 127.0.0.1 default, env SQUAD_ROOT, rate limit).
 - Ship report for Vikas (writeable page): https://claude.ai/code/artifact/7fb38f85-d85d-4fc4-b9a4-069c4f9ca192
+
+## FEATURE — "Real NOC triage" (requested by Vikas 2026-08-15, his words kept)
+Rename debate → TRIAGE. An issue (P1/P2/P3) starts a real-time triage: Jarvis
+pulls MANY relevant engineer-agents (not one) who each investigate from their
+own front with live data. UI: chat window gets a maximize button; Live
+Activity panel gets collapse/minimize. "We are building a real network center
+wherein all the expert engineers are there in the form of agents."
+Stage: 1-Unknowns (in progress). Build must wait for PR #3 (security) to merge
+— same files. Note: Vikas reported seeing agents named "steven"/"aci" in the
+UI; no such agents exist in code — to be checked with him.
