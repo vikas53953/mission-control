@@ -189,3 +189,13 @@ wherein all the expert engineers are there in the form of agents."
 Stage: 1-Unknowns (in progress). Build must wait for PR #3 (security) to merge
 — same files. Note: Vikas reported seeing agents named "steven"/"aci" in the
 UI; no such agents exist in code — to be checked with him.
+
+### Triage feature — Stage 1 answers (Vikas, 2026-08-15)
+1. Start: MANUAL (Option A) — Vikas opens a triage with severity + description;
+   auto-raise from live alarms is a later follow-up.
+2. Bridge flow: TWO ROUNDS (A) — R1 every engineer posts what its live front
+   shows; R2 Jarvis correlates and posts verdict + suggested next checks.
+3. Staffing: SEVERITY DECIDES (A) — P1 = all connected engineers; P2/P3 =
+   Jarvis picks relevant fronts; not-connected agents stay OFF the bridge,
+   named as blind spots in the summary.
+Stage 2 (Requirements) in progress — gate page to Vikas.
